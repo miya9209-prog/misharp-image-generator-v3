@@ -2,16 +2,14 @@
 app.displayDialogs = DialogModes.NO;
 
 /*
- * MISHARP PSD 자동 생성기 (v3 동일 UX)
- * 1) 템플릿 PSD 선택
- * 2) 치환할 이미지 선택
- * 3) job.json 선택 (상품명)
- * 4) 저장 폴더 선택 → output.psd / output.jpg 생성
- *
- * 템플릿 PSD 조건:
- * - 스마트오브젝트 레이어명: IMAGE_1
- * - 텍스트 레이어명: 상품명
- */
+MISHARP 상세페이지 PSD 생성기 (Smart Object 레이어 유지)
+
+- 사용법:
+  1) Streamlit에서 package.zip 다운로드 후 압축 해제
+  2) Photoshop → 파일 > 스크립트 > 찾아보기… → misharp_detailpage.jsx 실행
+  3) 압축 해제 폴더 선택 (job.json, images/ 폴더가 있어야 함)
+  4) output.psd / output.jpg 생성
+*/
 
 function readTextFile(f) {
   f.encoding = "UTF8";
@@ -21,75 +19,45 @@ function readTextFile(f) {
   return s;
 }
 
-function findLayerByName(container, name) {
-  for (var i = 0; i < container.layers.length; i++) {
-    var L = container.layers[i];
-    if (L.name === name) return L;
-    if (L.typename === "LayerSet") {
-      var r = findLayerByName(L, name);
-      if (r) return r;
-    }
-  }
-  return null;
-}
-
-function replaceTextLayer(doc, layerName, newText) {
-  var lyr = findLayerByName(doc, layerName);
-  if (!lyr || lyr.kind !== LayerKind.TEXT) return false;
-  lyr.textItem.contents = newText;
-  return true;
-}
-
-function replaceSmartObjectByImage(doc, smartLayerName, imageFile) {
-  var lyr = findLayerByName(doc, smartLayerName);
-  if (!lyr) throw new Error("스마트오브젝트 레이어 없음: " + smartLayerName);
-
-  doc.activeLayer = lyr;
-
-  // 스마트오브젝트 내용 열기
-  executeAction(stringIDToTypeID("placedLayerEditContents"), undefined, DialogModes.NO);
-
-  var soDoc = app.activeDocument;
-
-  // 기존 레이어 삭제(가능 범위)
-  for (var i = soDoc.layers.length - 1; i >= 0; i--) {
-    try { soDoc.layers[i].remove(); } catch (e) {}
-  }
-
-  // 이미지 Place
+function placeFileAsSmartObject(fileObj) {
   var desc = new ActionDescriptor();
-  desc.putPath(charIDToTypeID("null"), imageFile);
+  desc.putPath(charIDToTypeID("null"), fileObj);
   desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa"));
   executeAction(charIDToTypeID("Plc "), desc, DialogModes.NO);
-
-  var placed = soDoc.activeLayer;
-
-  // cover 맞춤
-  var soW = soDoc.width.as("px"), soH = soDoc.height.as("px");
-  var b = placed.bounds;
-  var w = (b[2].as("px") - b[0].as("px"));
-  var h = (b[3].as("px") - b[1].as("px"));
-  var scale = Math.max(soW / w, soH / h) * 100;
-  placed.resize(scale, scale, AnchorPosition.MIDDLECENTER);
-
-  // 중앙 정렬
-  b = placed.bounds;
-  placed.translate(
-    soW / 2 - (b[0].as("px") + b[2].as("px")) / 2,
-    soH / 2 - (b[1].as("px") + b[3].as("px")) / 2
-  );
-
-  soDoc.save();
-  soDoc.close(SaveOptions.SAVECHANGES);
-  app.activeDocument = doc;
+  return app.activeDocument.activeLayer; // placed smart object layer
 }
 
-function saveOutputs(doc, outFolder) {
+function layerBoundsPx(layer) {
+  var b = layer.bounds; // [L,T,R,B] in UnitValue
+  var L = b[0].as("px");
+  var T = b[1].as("px");
+  var R = b[2].as("px");
+  var B = b[3].as("px");
+  return { L: L, T: T, R: R, B: B, W: (R - L), H: (B - T) };
+}
+
+function scaleLayerToWidth(layer, targetW) {
+  var b = layerBoundsPx(layer);
+  if (b.W <= 0) throw new Error("레이어 폭을 읽을 수 없습니다.");
+  var scale = (targetW / b.W) * 100.0;
+  layer.resize(scale, scale, AnchorPosition.TOPLEFT);
+}
+
+function moveLayerTo(layer, x, y) {
+  var b = layerBoundsPx(layer);
+  var dx = x - b.L;
+  var dy = y - b.T;
+  layer.translate(dx, dy);
+}
+
+function savePSDAndJPG(doc, outFolder) {
+  // PSD
   var psdFile = new File(outFolder.fsName + "/output.psd");
   var psdOpt = new PhotoshopSaveOptions();
   psdOpt.layers = true;
   doc.saveAs(psdFile, psdOpt, true, Extension.LOWERCASE);
 
+  // JPG
   var jpgFile = new File(outFolder.fsName + "/output.jpg");
   var jpgOpt = new JPEGSaveOptions();
   jpgOpt.quality = 10;
@@ -97,34 +65,61 @@ function saveOutputs(doc, outFolder) {
 }
 
 try {
-  var psdFile = File.openDialog("템플릿 PSD 선택", "*.psd");
-  if (!psdFile) throw new Error("PSD 선택 취소");
+  var jobFolder = Folder.selectDialog("ZIP을 푼 폴더를 선택하세요 (job.json, images/ 필요)");
+  if (!jobFolder) throw new Error("폴더 선택 취소");
 
-  var imageFile = File.openDialog("치환할 이미지 선택", "*.png;*.jpg;*.jpeg;*.webp");
-  if (!imageFile) throw new Error("이미지 선택 취소");
-
-  var jobFile = File.openDialog("job.json 선택 (상품명)", "*.json");
-  if (!jobFile) throw new Error("job.json 선택 취소");
+  var jobFile = new File(jobFolder.fsName + "/job.json");
+  if (!jobFile.exists) throw new Error("job.json이 없습니다: " + jobFile.fsName);
 
   var job = JSON.parse(readTextFile(jobFile));
-  var productName = job.product_name || "";
 
-  var doc = app.open(psdFile);
+  var width = job.layout.width;
+  var totalHeight = job.layout.total_height;
+  if (!width || !totalHeight) throw new Error("job.json에 layout.width 또는 layout.total_height가 없습니다.");
 
-  var okText = replaceTextLayer(doc, "상품명", productName);
-  if (!okText) alert("경고: '상품명' 텍스트 레이어를 찾지 못했습니다. 계속 진행합니다.");
+  // 새 문서 생성 (배경 흰색)
+  var doc = app.documents.add(
+    width,
+    totalHeight,
+    72,
+    "MISHARP_DETAILPAGE",
+    NewDocumentMode.RGB,
+    DocumentFill.WHITE
+  );
 
-  replaceSmartObjectByImage(doc, "IMAGE_1", imageFile);
+  // 이미지들을 순서대로 배치
+  var images = job.images;
+  if (!images || images.length === 0) throw new Error("job.json에 images 배열이 없습니다.");
 
-  var outFolder = Folder.selectDialog("결과 저장 폴더 선택");
-  if (!outFolder) throw new Error("저장 폴더 선택 취소");
+  for (var i = 0; i < images.length; i++) {
+    var it = images[i];
+    var zipName = it.zip_filename; // "images/image_001.jpg"
+    var y = it.y;
+    var layerName = it.layer_name; // "IMAGE_001"
 
-  saveOutputs(doc, outFolder);
+    var imgFile = new File(jobFolder.fsName + "/" + zipName);
+    if (!imgFile.exists) throw new Error("이미지 파일이 없습니다: " + imgFile.fsName);
 
+    var layer = placeFileAsSmartObject(imgFile);
+    layer.name = layerName;
+
+    // 폭 맞추고, (0, y)에 붙이기
+    scaleLayerToWidth(layer, width);
+    moveLayerTo(layer, 0, y);
+  }
+
+  // 저장 위치: 선택(또는 jobFolder 그대로 쓰고 싶으면 이 줄을 jobFolder로 고정하면 됨)
+  var outFolder = Folder.selectDialog("저장 폴더 선택 (output.psd / output.jpg)");
+  if (!outFolder) outFolder = jobFolder;
+
+  savePSDAndJPG(doc, outFolder);
+
+  // 닫기(저장했으니)
   doc.close(SaveOptions.DONOTSAVECHANGES);
 
   alert("완료! output.psd / output.jpg 생성되었습니다.");
+
 } catch (e) {
   alert("오류:\n" + e.toString());
-  try { app.activeDocument.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
+  try { if (app.documents.length > 0) app.activeDocument.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
 }
