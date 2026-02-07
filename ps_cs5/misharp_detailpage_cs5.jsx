@@ -2,59 +2,43 @@
 
 (function () {
 
-    // ===== SILENT / SPEED SETTINGS =====
-    var SHOW_DONE_ALERT = false;        // 끝나고 팝업 끄기
-    var DO_REFRESH = false;             // 중간 화면 갱신 최소화
+    // ===== SETTINGS =====
+    var CANVAS_WIDTH = 900;
+    var TOP_MARGIN = 80;
+    var GAP = 70;
+    var BOTTOM_MARGIN = 120;
 
-    // ===== LAYOUT SETTINGS (v3에서 숫자 치환됨) =====
-    var CANVAS_WIDTH = 900;      // px
-    var TOP_MARGIN = 80;         // px
-    var GAP = 70;                // px
-    var BOTTOM_MARGIN = 120;     // px
-
-    var FOOTER_ENABLED = true;
     var FOOTER_TEXT = "© MISHARP. All rights reserved.  |  misharp.co.kr";
     var FOOTER_FONT = "MalgunGothic";
     var FOOTER_SIZE = 18;
-    var FOOTER_COLOR = [80, 80, 80];
-    var FOOTER_MARGIN_TOP = 40;
 
-    var JPG_QUALITY = 10;        // 1~12
-
+    var JPG_QUALITY = 10;
+    var SHOW_DONE_ALERT = false;
 
     // ===== helpers =====
     function px(v) { return new UnitValue(v, "px"); }
 
-    function baseName(fileName) {
-        var dot = fileName.lastIndexOf(".");
-        if (dot > 0) return fileName.substring(0, dot);
-        return fileName;
-    }
-
-    function sortByName(files) {
+    function sortFiles(files) {
         files.sort(function (a, b) {
             return a.name.toLowerCase() > b.name.toLowerCase() ? 1 : -1;
         });
         return files;
     }
 
-    function getImageFiles(folder) {
-        var files = folder.getFiles(function (f) {
-            return (f instanceof File) && f.name.match(/\.(jpg|jpeg|png)$/i) && f.name.indexOf("._") !== 0;
-        });
-        return sortByName(files);
+    function getImages(folder) {
+        return sortFiles(folder.getFiles(function (f) {
+            return f instanceof File && f.name.match(/\.(jpg|jpeg|png)$/i);
+        }));
     }
 
-    function openToGetSize(file) {
+    function openSize(file) {
         var d = app.open(file);
-        var w = d.width.as("px");
-        var h = d.height.as("px");
+        var s = { w: d.width.as("px"), h: d.height.as("px") };
         d.close(SaveOptions.DONOTSAVECHANGES);
-        return { w: w, h: h };
+        return s;
     }
 
-    function placeAsSmartObject(file) {
-        // 강제로 "Place Embedded" 를 Dialog 없이 실행
+    function placeSO(file) {
         var oldDialogs = app.displayDialogs;
         app.displayDialogs = DialogModes.NO;
 
@@ -67,108 +51,57 @@
         return app.activeDocument.activeLayer;
     }
 
-    function getLayerW(layer) {
+    function layerWidth(layer) {
         var b = layer.bounds;
-        return (b[2].as("px") - b[0].as("px"));
+        return b[2].as("px") - b[0].as("px");
     }
 
-    function resizeLayerToWidth(layer, targetW) {
-        var w = getLayerW(layer);
-        if (w <= 0.01) return;
-        var scale = (targetW / w) * 100.0;
+    function resizeToWidth(layer, w) {
+        var scale = (w / layerWidth(layer)) * 100;
         layer.resize(scale, scale, AnchorPosition.TOPLEFT);
     }
 
-    function moveLayerTo(layer, x, y) {
+    function moveTo(layer, x, y) {
         var b = layer.bounds;
-        var curX = b[0].as("px");
-        var curY = b[1].as("px");
-        layer.translate(x - curX, y - curY);
+        layer.translate(x - b[0].as("px"), y - b[1].as("px"));
     }
 
-    function addFooter(doc, yTop) {
-        if (!FOOTER_ENABLED) return;
-
-        var t = doc.artLayers.add();
-        t.kind = LayerKind.TEXT;
-        t.name = "copyright";
-
-        var ti = t.textItem;
-        ti.contents = FOOTER_TEXT;
-        ti.size = FOOTER_SIZE;
-        try { ti.font = FOOTER_FONT; } catch (e) {}
-
-        ti.color.rgb.red = FOOTER_COLOR[0];
-        ti.color.rgb.green = FOOTER_COLOR[1];
-        ti.color.rgb.blue = FOOTER_COLOR[2];
-
-        ti.justification = Justification.CENTER;
-        ti.position = [px(CANVAS_WIDTH / 2), px(yTop + (FOOTER_SIZE * 2))];
-    }
-
-    function savePSD(doc, outFile) {
-        var opts = new PhotoshopSaveOptions();
-        opts.layers = true;
-        opts.embedColorProfile = true;
-        doc.saveAs(outFile, opts, true, Extension.LOWERCASE);
-    }
-
-    function saveJPGFromPSD(doc, outFile) {
-        var dup = doc.duplicate(doc.name + "_jpg", true);
-        dup.flatten();
-
-        var jpg = new JPEGSaveOptions();
-        jpg.quality = JPG_QUALITY;
-        jpg.embedColorProfile = true;
-
-        dup.saveAs(outFile, jpg, true, Extension.LOWERCASE);
-        dup.close(SaveOptions.DONOTSAVECHANGES);
-    }
-
-
-    // ===== main =====
-    var originalRuler = app.preferences.rulerUnits;
+    // ===== STATE SAVE (CS5 SAFE) =====
     var oldDialogs = app.displayDialogs;
     var oldUnits = app.preferences.rulerUnits;
-    var oldActiveDoc = app.activeDocument;
+    var oldActiveDoc = (app.documents.length > 0) ? app.activeDocument : null;
 
-    // 가장 중요한 부분: "조용히 실행" + "화면 업데이트 최소화"
     app.displayDialogs = DialogModes.NO;
     app.preferences.rulerUnits = Units.PIXELS;
 
     try {
-        var imgFolder = Folder.selectDialog("Select folder containing images (JPG/PNG)");
+        var imgFolder = Folder.selectDialog("이미지 폴더 선택");
         if (!imgFolder) return;
 
-        var images = getImageFiles(imgFolder);
-        if (!images || images.length === 0) {
-            alert("No images found in the selected folder.");
+        var imgs = getImages(imgFolder);
+        if (imgs.length === 0) {
+            alert("이미지가 없습니다.");
             return;
         }
 
-        var outFolder = Folder.selectDialog("Select output folder to save PSD and JPG");
+        var outFolder = Folder.selectDialog("저장 폴더 선택");
         if (!outFolder) return;
 
-        var defaultName = baseName(images[0].name);
-        var outName = prompt("Output file name (without extension)", defaultName);
-        if (!outName || outName.replace(/\s/g, "") === "") outName = defaultName;
+        var name = prompt("파일명", imgs[0].name.replace(/\.[^\.]+$/, ""));
+        if (!name) return;
 
-        // 1) canvas height 계산 (원본비율 유지)
-        var scaledHeights = [];
-        var totalImagesH = 0;
+        var heights = [];
+        var totalH = 0;
 
-        for (var i = 0; i < images.length; i++) {
-            var s = openToGetSize(images[i]);
-            var hScaled = Math.round(s.h * (CANVAS_WIDTH / s.w));
-            if (hScaled < 1) hScaled = 1;
-            scaledHeights.push(hScaled);
-            totalImagesH += hScaled;
+        for (var i = 0; i < imgs.length; i++) {
+            var s = openSize(imgs[i]);
+            var h = Math.round(s.h * (CANVAS_WIDTH / s.w));
+            heights.push(h);
+            totalH += h;
         }
 
-        var footerH = FOOTER_ENABLED ? (FOOTER_MARGIN_TOP + Math.round(FOOTER_SIZE * 2.2) + 12) : 0;
-        var canvasH = TOP_MARGIN + totalImagesH + (GAP * (images.length - 1)) + BOTTOM_MARGIN + footerH;
+        var canvasH = TOP_MARGIN + totalH + GAP * (imgs.length - 1) + BOTTOM_MARGIN + 80;
 
-        // 2) 새 PSD 만들기
         var doc = app.documents.add(
             px(CANVAS_WIDTH),
             px(canvasH),
@@ -178,44 +111,48 @@
             DocumentFill.WHITE
         );
 
-        // 화면 업데이트 최소화: background layer 잠금 유지, history도 최소화
         var y = TOP_MARGIN;
 
-        for (var j = 0; j < images.length; j++) {
-            var layer = placeAsSmartObject(images[j]);
-            layer.name = images[j].name;
-
-            // refresh 제거(움직임/깜빡임 줄이기)
-            resizeLayerToWidth(layer, CANVAS_WIDTH);
-            moveLayerTo(layer, 0, y);
-
-            y += scaledHeights[j] + GAP;
-
-            if (DO_REFRESH) app.refresh();
+        for (var j = 0; j < imgs.length; j++) {
+            var l = placeSO(imgs[j]);
+            resizeToWidth(l, CANVAS_WIDTH);
+            moveTo(l, 0, y);
+            y += heights[j] + GAP;
         }
 
-        if (FOOTER_ENABLED) {
-            y += (FOOTER_MARGIN_TOP - GAP);
-            addFooter(doc, y);
-        }
+        // footer
+        var t = doc.artLayers.add();
+        t.kind = LayerKind.TEXT;
+        t.name = "copyright";
+        t.textItem.contents = FOOTER_TEXT;
+        t.textItem.size = FOOTER_SIZE;
+        try { t.textItem.font = FOOTER_FONT; } catch (e) {}
+        t.textItem.justification = Justification.CENTER;
+        t.textItem.position = [px(CANVAS_WIDTH / 2), px(y + 40)];
 
-        // 3) 저장
-        var psdFile = new File(outFolder.fsName + "/" + outName + ".psd");
-        var jpgFile = new File(outFolder.fsName + "/" + outName + ".jpg");
+        // save
+        var psd = new File(outFolder + "/" + name + ".psd");
+        var jpg = new File(outFolder + "/" + name + ".jpg");
 
-        savePSD(doc, psdFile);
-        saveJPGFromPSD(doc, jpgFile);
+        var psdOpt = new PhotoshopSaveOptions();
+        psdOpt.layers = true;
+        doc.saveAs(psd, psdOpt, true);
 
-        if (SHOW_DONE_ALERT) {
-            alert("Done.\nSaved:\n" + psdFile.fsName + "\n" + jpgFile.fsName);
-        }
+        var dup = doc.duplicate();
+        dup.flatten();
+        var jpgOpt = new JPEGSaveOptions();
+        jpgOpt.quality = JPG_QUALITY;
+        dup.saveAs(jpg, jpgOpt, true);
+        dup.close(SaveOptions.DONOTSAVECHANGES);
 
-    } catch (err) {
-        alert("Error:\n" + err);
+        if (SHOW_DONE_ALERT) alert("완료");
+
+    } catch (e) {
+        alert("에러:\n" + e);
     } finally {
         app.displayDialogs = oldDialogs;
         app.preferences.rulerUnits = oldUnits;
-        app.preferences.rulerUnits = originalRuler;
+        if (oldActiveDoc) app.activeDocument = oldActiveDoc;
     }
 
 })();
