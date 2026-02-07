@@ -2,86 +2,126 @@
 app.displayDialogs = DialogModes.NO;
 app.bringToFront();
 
-// MISHARP_AUTO_V9  (이 문구가 ZIP안 JSX에 있으면 최신입니다)
+function parseJSON(txt){ return eval("(" + txt + ")"); }
 
-function parseJSON(txt) { return eval("(" + txt + ")"); }
-function readTextFile(f) {
+function readTextFile(f){
   f.encoding = "UTF8";
-  if (!f.open("r")) throw new Error("파일 열기 실패: " + f.fsName);
+  if(!f.open("r")) throw new Error("파일 열기 실패: " + f.fsName);
   var s = f.read();
   f.close();
   return s;
 }
 
-function placeFileAsSmartObject(fileObj) {
-  var desc = new ActionDescriptor();
-  desc.putPath(charIDToTypeID("null"), fileObj);
-  desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa"));
-  executeAction(charIDToTypeID("Plc "), desc, DialogModes.NO);
-  return app.activeDocument.activeLayer;
-}
-
-function layerBoundsPx(layer) {
+function boundsPx(layer){
   var b = layer.bounds;
   var L = b[0].as("px"), T = b[1].as("px"), R = b[2].as("px"), B = b[3].as("px");
-  return { L: L, T: T, W: (R - L), H: (B - T) };
+  return {L:L, T:T, W:(R-L), H:(B-T)};
 }
 
-function scaleLayerToWidth(layer, targetW) {
-  var b = layerBoundsPx(layer);
-  if (b.W <= 0) throw new Error("레이어 폭을 읽을 수 없습니다.");
-  var scale = (targetW / b.W) * 100.0;
-  layer.resize(scale, scale, AnchorPosition.TOPLEFT);
-}
-
-function moveLayerTo(layer, x, y) {
-  var b = layerBoundsPx(layer);
+function moveTo(layer, x, y){
+  var b = boundsPx(layer);
   layer.translate(x - b.L, y - b.T);
 }
 
-try {
-  // ✅ JSX가 있는 폴더 기준으로 job.json 자동 탐색
-  var jobFolder = File($.fileName).parent;
-  var jobFile = new File(jobFolder.fsName + "/job.json");
-  if (!jobFile.exists) throw new Error("job.json 없음: " + jobFile.fsName);
+// ✅ CS6 호환 Smart Object 변환
+function convertToSmartObjectActiveLayer(){
+  try{
+    var idnewPlacedLayer = stringIDToTypeID("newPlacedLayer");
+    executeAction(idnewPlacedLayer, undefined, DialogModes.NO);
+  }catch(e){
+    // 구버전 대비(대부분 CS6는 위가 됨)
+    try{
+      var id = stringIDToTypeID("convertToSmartObject");
+      executeAction(id, undefined, DialogModes.NO);
+    }catch(e2){
+      // 실패해도 일단 진행
+    }
+  }
+}
+
+// ✅ Place 대신: 이미지 열기 → 전체복사 → 대상 문서에 붙여넣기 → 스마트오브젝트 변환
+function pasteImageAsSmartObject(targetDoc, imgFile){
+  var src = app.open(imgFile);
+  app.activeDocument = src;
+
+  // 배경만 있는 경우 activeLayer 그대로
+  src.selection.selectAll();
+  src.selection.copy();
+
+  app.activeDocument = targetDoc;
+  var pasted = targetDoc.paste();
+  targetDoc.activeLayer = pasted;
+
+  convertToSmartObjectActiveLayer();
+
+  // 소스 닫기
+  app.activeDocument = src;
+  src.close(SaveOptions.DONOTSAVECHANGES);
+
+  app.activeDocument = targetDoc;
+  return targetDoc.activeLayer;
+}
+
+function runOneFolder(folder){
+  var jobFile = new File(folder.fsName + "/job.json");
+  if(!jobFile.exists) throw new Error("job.json 없음: " + jobFile.fsName);
 
   var job = parseJSON(readTextFile(jobFile));
   var width = job.layout.width;
-  var totalHeight = job.layout.total_height;
+  var totalH = job.layout.total_height;
 
-  if (!width || !totalHeight) throw new Error("layout.width/total_height 누락");
-
-  var doc = app.documents.add(
-    width, totalHeight, 72,
-    "MISHARP_DETAILPAGE",
-    NewDocumentMode.RGB,
-    DocumentFill.WHITE
-  );
+  var doc = app.documents.add(width, totalH, 72, "MISHARP_DETAILPAGE", NewDocumentMode.RGB, DocumentFill.WHITE);
 
   var images = job.images;
-  if (!images || images.length === 0) throw new Error("job.images 비어있음");
-
-  for (var i = 0; i < images.length; i++) {
+  for(var i=0; i<images.length; i++){
     var it = images[i];
-    var rel = (it.zip_filename || "").replace(/\\/g, "/"); // 역슬래시 정리
+    var rel = (it.zip_filename || "").replace(/\\/g, "/");
+    var imgFile = new File(folder.fsName + "/" + rel);
+    if(!imgFile.exists){
+      imgFile = new File(folder.fsName + "/images/" + rel);
+    }
+    if(!imgFile.exists) throw new Error("이미지 파일 못 찾음: " + imgFile.fsName);
 
-    // ✅ zip_filename이 "images/image_001.jpg"면 그대로 씀 (images 중복 방지)
-    var imgFile = new File(jobFolder.fsName + "/" + rel);
+    var layer = pasteImageAsSmartObject(doc, imgFile);
+    layer.name = it.layer_name || ("IMAGE_" + (i+1));
 
-    // ✅ 혹시 zip_filename이 "image_001.jpg"처럼 들어오면 images/ 붙여서 2차 시도
-    if (!imgFile.exists) imgFile = new File(jobFolder.fsName + "/images/" + rel);
-
-    if (!imgFile.exists) throw new Error("이미지 파일 못 찾음: " + imgFile.fsName);
-
-    var layer = placeFileAsSmartObject(imgFile);
-    layer.name = it.layer_name || ("IMAGE_" + (i + 1));
-
-    scaleLayerToWidth(layer, width);
-    moveLayerTo(layer, 0, it.y || 0);
+    var b = boundsPx(layer);
+    var x = Math.round((width - b.W) / 2);
+    moveTo(layer, x, it.y || 0);
   }
 
-  // ✅ 팝업/저장 없이 PSD는 열린 상태로 남음
+  // ✅ PSD를 "열어둔 상태"로 두고 끝 (형준님이 바로 저장/수정 가능)
+  // 자동저장을 원하면 여기서 doc.saveAs(...) 추가하면 됩니다.
+}
 
-} catch (e) {
-  alert("스크립트 오류:\n" + e.toString());
+try{
+  // ✅ 스크립트 파일이 있는 폴더 = ZIP을 푼 루트여야 함
+  var root = File($.fileName).parent;
+
+  // part_01, part_02... 자동 탐색
+  var parts = root.getFiles(function(f){
+    return (f instanceof Folder) && /^part_\d+$/i.test(f.name);
+  });
+
+  if(parts && parts.length > 0){
+    parts.sort(function(a,b){
+      var na = parseInt(a.name.replace(/\D+/g,""), 10);
+      var nb = parseInt(b.name.replace(/\D+/g,""), 10);
+      return na - nb;
+    });
+    for(var i=0; i<parts.length; i++){
+      runOneFolder(parts[i]);
+    }
+  }else{
+    // 분할이 없는 경우(이미지 <= 6) 루트 job.json 지원
+    var directJob = new File(root.fsName + "/job.json");
+    if(directJob.exists){
+      runOneFolder(root);
+    }else{
+      throw new Error("part_01 폴더도 없고 루트 job.json도 없습니다. ZIP을 '그대로' 푼 폴더에서 실행했는지 확인하세요.");
+    }
+  }
+
+}catch(e){
+  alert("MISHARP 스크립트 오류:\n" + e.toString());
 }
