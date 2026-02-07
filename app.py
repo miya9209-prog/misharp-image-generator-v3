@@ -1,84 +1,78 @@
 import io
 import os
 import re
+import json
 import zipfile
-from dataclasses import dataclass
 from typing import List, Tuple
 
 import streamlit as st
 from PIL import Image
 
-
-# =========================
-# Config
-# =========================
-APP_TITLE = "MISHARP 이미지 생성기 v3.2"
+# -----------------
+# 기본값 (A안)
+# -----------------
+APP_TITLE = "MISHARP 상세페이지 생성기 v3.3"
 MAX_PER_PSD = 6
 DEFAULT_GAP = 300
-DEFAULT_TOP_BOTTOM = 300
+DEFAULT_TOP = 300
+DEFAULT_BOTTOM = 300
 DEFAULT_BG = (255, 255, 255)
 
 Image.MAX_IMAGE_PIXELS = None
 
 
-# =========================
-# Helpers
-# =========================
-def _clean_filename(name: str) -> str:
-    name = name.strip()
-    name = re.sub(r"[^\w\-.() ]+", "_", name)
+# -----------------
+# 유틸
+# -----------------
+def clean_filename(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"[^\w\-.()가-힣 ]+", "_", name)
     name = re.sub(r"\s+", " ", name)
-    return name or "file"
+    return name or "misharp"
 
 
-def _is_image_filename(name: str) -> bool:
+def is_image(name: str) -> bool:
     ext = os.path.splitext(name.lower())[1]
     return ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]
 
 
-def _open_image_bytes(data: bytes) -> Image.Image:
+def open_image_bytes(data: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(data))
     if getattr(img, "is_animated", False):
         img.seek(0)
     return img.convert("RGBA")
 
 
-def _to_rgb_on_white(img_rgba: Image.Image, bg=(255, 255, 255)) -> Image.Image:
+def rgba_to_rgb_white(img_rgba: Image.Image, bg=(255, 255, 255)) -> Image.Image:
     bg_img = Image.new("RGBA", img_rgba.size, bg + (255,))
     bg_img.alpha_composite(img_rgba)
     return bg_img.convert("RGB")
 
 
-def _make_stacked_jpg(
-    images: List[Tuple[str, bytes]],
-    gap: int,
-    top: int,
-    bottom: int,
-    bg_rgb=(255, 255, 255),
-) -> bytes:
-    pil_images: List[Image.Image] = []
-    sizes: List[Tuple[int, int]] = []
-
+def make_stacked_jpg(images: List[Tuple[str, bytes]], gap: int, top: int, bottom: int) -> bytes:
+    pil = []
+    sizes = []
     max_w = 0
-    for name, data in images:
-        if not _is_image_filename(name):
+
+    for n, b in images:
+        if not is_image(n):
             continue
-        img = _open_image_bytes(data)
-        w, h = img.size
+        im = open_image_bytes(b)
+        w, h = im.size
         max_w = max(max_w, w)
-        pil_images.append(img)
+        pil.append(im)
         sizes.append((w, h))
 
-    if not pil_images:
-        raise ValueError("이미지 파일(JPG/PNG/WEBP/GIF 등)이 1개 이상 필요합니다.")
+    if not pil:
+        raise ValueError("이미지(JPG/PNG/WEBP/GIF 등)를 1개 이상 올려주세요.")
 
     total_h = top + bottom + sum(h for _, h in sizes) + gap * (len(sizes) - 1)
-    canvas = Image.new("RGB", (max_w, total_h), bg_rgb)
+    canvas = Image.new("RGB", (max_w, total_h), DEFAULT_BG)
 
     y = top
-    for img, (w, h) in zip(pil_images, sizes):
+    for im, (w, h) in zip(pil, sizes):
         x = (max_w - w) // 2
-        rgb = _to_rgb_on_white(img, bg_rgb)
+        rgb = rgba_to_rgb_white(im, DEFAULT_BG)
         canvas.paste(rgb, (x, y))
         y += h + gap
 
@@ -87,256 +81,175 @@ def _make_stacked_jpg(
     return out.getvalue()
 
 
-@dataclass
-class JobImage:
-    zip_filename: str
-    layer_name: str
-    y: int
+def build_jobs(images: List[Tuple[str, bytes]], gap: int, top: int, bottom: int, base_name: str):
+    only = [(n, b) for n, b in images if is_image(n)]
+    if not only:
+        raise ValueError("이미지(JPG/PNG/WEBP/GIF 등)를 1개 이상 올려주세요.")
 
-
-def _build_jobs_split_6(
-    images: List[Tuple[str, bytes]],
-    gap: int,
-    top: int,
-    bottom: int,
-) -> List[dict]:
-    only_imgs = [(n, b) for (n, b) in images if _is_image_filename(n)]
-    if not only_imgs:
-        raise ValueError("이미지 파일(JPG/PNG/WEBP/GIF 등)이 1개 이상 필요합니다.")
-
-    jobs = []
-    for part_idx in range(0, len(only_imgs), MAX_PER_PSD):
-        chunk = only_imgs[part_idx:part_idx + MAX_PER_PSD]
-
-        sizes = []
-        max_w = 0
-        for n, b in chunk:
-            img = _open_image_bytes(b)
-            w, h = img.size
-            sizes.append((w, h))
-            max_w = max(max_w, w)
-
-        total_h = top + bottom + sum(h for _, h in sizes) + gap * (len(sizes) - 1)
-
-        imgs_meta: List[JobImage] = []
-        y = top
-        for i, ((n, _), (w, h)) in enumerate(zip(chunk, sizes), start=1):
-            global_idx = part_idx + i
-            ext = os.path.splitext(n)[1].lower()
-            if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]:
-                ext = ".jpg"
-            filename = f"images/image_{global_idx:03d}{ext}"
-            layer = f"IMAGE_{global_idx:03d}"
-            imgs_meta.append(JobImage(zip_filename=filename.replace("\\", "/"), layer_name=layer, y=y))
-            y += h + gap
-
-        job = {
-            "version": "misharp_detailpage_job_v3",
-            "layout": {
-                "width": int(max_w),
-                "total_height": int(total_h),
-                "top_margin": int(top),
-                "bottom_margin": int(bottom),
-                "gap": int(gap),
-                "background": {"r": 255, "g": 255, "b": 255},
-                "center_align": True,
-                "scale_to_width": False,
-            },
-            "images": [
-                {"zip_filename": im.zip_filename, "layer_name": im.layer_name, "y": im.y}
-                for im in imgs_meta
-            ],
-        }
-        jobs.append(job)
-
-    return jobs
-
-
-def _make_master_jsx() -> str:
-    return r'''#target photoshop
-app.displayDialogs = DialogModes.NO;
-app.bringToFront();
-
-function parseJSON(txt){ return eval("(" + txt + ")"); }
-function readTextFile(f){
-  f.encoding="UTF8";
-  if(!f.open("r")) throw new Error("파일 열기 실패: " + f.fsName);
-  var s=f.read(); f.close(); return s;
-}
-function placeSmart(fileObj){
-  var desc=new ActionDescriptor();
-  desc.putPath(charIDToTypeID("null"), fileObj);
-  desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa"));
-  executeAction(charIDToTypeID("Plc "), desc, DialogModes.NO);
-  return app.activeDocument.activeLayer;
-}
-function boundsPx(layer){
-  var b=layer.bounds;
-  var L=b[0].as("px"), T=b[1].as("px"), R=b[2].as("px"), B=b[3].as("px");
-  return {L:L, T:T, W:(R-L), H:(B-T)};
-}
-function moveTo(layer, x, y){
-  var b=boundsPx(layer);
-  layer.translate(x - b.L, y - b.T);
-}
-function runOneFolder(folder){
-  var jobFile = new File(folder.fsName + "/job.json");
-  if(!jobFile.exists) throw new Error("job.json 없음: " + jobFile.fsName);
-
-  var job = parseJSON(readTextFile(jobFile));
-  var width = job.layout.width;
-  var totalH = job.layout.total_height;
-
-  var doc = app.documents.add(width, totalH, 72, "MISHARP_DETAILPAGE", NewDocumentMode.RGB, DocumentFill.WHITE);
-
-  var images = job.images;
-  for(var i=0;i<images.length;i++){
-    var it = images[i];
-    var rel = (it.zip_filename || "").replace(/\\/g,"/");
-    var imgFile = new File(folder.fsName + "/" + rel);
-    if(!imgFile.exists){
-      imgFile = new File(folder.fsName + "/images/" + rel);
-    }
-    if(!imgFile.exists) throw new Error("이미지 파일 못 찾음: " + imgFile.fsName);
-
-    var layer = placeSmart(imgFile);
-    layer.name = it.layer_name || ("IMAGE_" + (i+1));
-
-    var b = boundsPx(layer);
-    var x = Math.round((width - b.W) / 2);
-    moveTo(layer, x, it.y || 0);
-  }
-}
-
-try{
-  var root = File($.fileName).parent;
-  var parts = root.getFiles(function(f){
-    return (f instanceof Folder) && /^part_\d+$/i.test(f.name);
-  });
-
-  if(!parts || parts.length === 0){
-    var directJob = new File(root.fsName + "/job.json");
-    if(directJob.exists){
-      runOneFolder(root);
-    } else {
-      throw new Error("part_01 폴더도 없고, 루트 job.json도 없습니다.");
-    }
-  } else {
-    parts.sort(function(a,b){
-      var na=parseInt(a.name.replace(/\D+/g,""),10);
-      var nb=parseInt(b.name.replace(/\D+/g,""),10);
-      return na-nb;
-    });
-
-    for(var i=0;i<parts.length;i++){
-      runOneFolder(parts[i]);
-    }
-  }
-
-}catch(e){
-  alert("MISHARP 스크립트 오류:\n" + e.toString());
-}
-'''
-
-
-def _json_dumps(obj) -> str:
-    import json
-    return json.dumps(obj, ensure_ascii=False, indent=2)
-
-
-def _zip_package(
-    all_files: List[Tuple[str, bytes]],
-    gap: int,
-    top: int,
-    bottom: int,
-) -> bytes:
-    jobs = _build_jobs_split_6(all_files, gap=gap, top=top, bottom=bottom)
-
-    only_imgs = [(n, b) for (n, b) in all_files if _is_image_filename(n)]
+    # 전체 인덱스별 zip 내부 경로
     image_payloads = []
-    for idx, (n, b) in enumerate(only_imgs, start=1):
+    for idx, (n, b) in enumerate(only, start=1):
         ext = os.path.splitext(n)[1].lower()
         if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]:
             ext = ".jpg"
         image_payloads.append((idx, ext, b))
 
+    jobs = []
+    for start in range(0, len(only), MAX_PER_PSD):
+        chunk = only[start:start + MAX_PER_PSD]
+
+        # 사이즈 산출
+        max_w = 0
+        sizes = []
+        for n, b in chunk:
+            im = open_image_bytes(b)
+            w, h = im.size
+            max_w = max(max_w, w)
+            sizes.append((w, h))
+
+        total_h = top + bottom + sum(h for _, h in sizes) + gap * (len(sizes) - 1)
+
+        # 각 이미지 배치 y 좌표
+        y = top
+        items = []
+        for i, ((n, _), (w, h)) in enumerate(zip(chunk, sizes), start=1):
+            global_idx = start + i
+            ext = os.path.splitext(n)[1].lower()
+            if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]:
+                ext = ".jpg"
+            items.append({
+                "zip_filename": f"images/image_{global_idx:03d}{ext}",
+                "layer_name": f"IMAGE_{global_idx:03d}",
+                "y": int(y),
+            })
+            y += h + gap
+
+        part_no = (start // MAX_PER_PSD) + 1
+        jobs.append({
+            "version": "misharp_detailpage_job_v3",
+            "base_name": base_name,
+            "part_no": part_no,
+            "layout": {
+                "width": int(max_w),
+                "total_height": int(total_h),
+                "gap": int(gap),
+                "top_margin": int(top),
+                "bottom_margin": int(bottom),
+                "center_align": True,
+            },
+            "images": items,
+        })
+
+    return jobs, image_payloads
+
+
+def load_jsx_from_repo():
+    """
+    repo 루트/tools/misharp_detailpage.jsx 또는 repo 루트/misharp_detailpage.jsx를 우선 사용
+    (없으면 빈 문자열)
+    """
+    candidates = [
+        os.path.join(os.getcwd(), "tools", "misharp_detailpage.jsx"),
+        os.path.join(os.getcwd(), "misharp_detailpage.jsx"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                return f.read()
+    return ""
+
+
+def make_zip_package(images: List[Tuple[str, bytes]], gap: int, top: int, bottom: int, base_name: str) -> bytes:
+    jobs, image_payloads = build_jobs(images, gap, top, bottom, base_name)
+
+    jsx_text = load_jsx_from_repo()
+    if not jsx_text:
+        raise ValueError("repo에 tools/misharp_detailpage.jsx 파일이 없습니다. (JSX를 먼저 추가해 주세요)")
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("misharp_detailpage.jsx", _make_master_jsx())
+        # JSX 루트로
+        z.writestr("misharp_detailpage.jsx", jsx_text)
+
+        # README
         z.writestr(
             "README.txt",
             "\n".join([
                 "MISHARP 상세페이지 패키지",
                 "",
+                "사용법",
                 "1) ZIP 압축 해제",
                 "2) Photoshop 실행",
                 "3) 파일 > 스크립트 > 찾아보기... > misharp_detailpage.jsx 선택",
-                "4) PSD가 part_01, part_02 ... 순서대로 자동 생성되어 열립니다 (Smart Object 유지).",
+                "4) part_01, part_02... 순서대로 PSD가 자동 생성되어 '바로 열립니다'(Smart Object 유지).",
                 "",
-                f"- 기본 간격(gap): {gap}px",
-                f"- 상/하단 여백: {top}px / {bottom}px",
-                f"- PSD는 6장 단위로 자동 분할됩니다.",
+                f"- 기본 이미지 간격: {gap}px",
+                f"- 상단/하단 여백: {top}px / {bottom}px",
+                f"- 6장 초과 시 자동 분할 (A안)",
                 "",
                 "ⓒ misharpcompany. All rights reserved.",
                 "본 프로그램은 미샵컴퍼니 내부 직원 전용입니다.",
             ])
         )
 
-        for pi, job in enumerate(jobs, start=1):
-            part_name = f"part_{pi:02d}"
-            z.writestr(f"{part_name}/job.json", _json_dumps(job).encode("utf-8"))
+        # part 폴더들 + job.json + images
+        for job in jobs:
+            part = f"part_{job['part_no']:02d}"
+            z.writestr(f"{part}/job.json", json.dumps(job, ensure_ascii=False, indent=2).encode("utf-8"))
 
-            needed = []
-            for im in job["images"]:
-                base = os.path.basename(im["zip_filename"])
+            # 이 파트가 필요한 이미지 번호만 넣기
+            need_nums = []
+            for it in job["images"]:
+                base = os.path.basename(it["zip_filename"])
                 m = re.search(r"image_(\d+)\.", base, re.IGNORECASE)
                 if m:
-                    needed.append(int(m.group(1)))
-            needed_set = set(needed)
+                    need_nums.append(int(m.group(1)))
+            need_set = set(need_nums)
 
             for idx, ext, data in image_payloads:
-                if idx in needed_set:
-                    z.writestr(f"{part_name}/images/image_{idx:03d}{ext}", data)
+                if idx in need_set:
+                    z.writestr(f"{part}/images/image_{idx:03d}{ext}", data)
 
     return buf.getvalue()
 
 
-# =========================
-# Streamlit UI (items -> file_list 로 변경)
-# =========================
+# -----------------
+# Streamlit State
+# -----------------
 def init_state():
     if "file_list" not in st.session_state:
         st.session_state.file_list = []
-    if "msg" not in st.session_state:
-        st.session_state.msg = ""
 
 
 def add_files(files):
     if not files:
         return
     for f in files:
-        name = _clean_filename(f.name)
+        name = clean_filename(f.name)
         data = f.getvalue()
         st.session_state.file_list.append({"name": name, "data": data})
 
 
-def move_item(idx: int, direction: int):
-    items = st.session_state.file_list
-    j = idx + direction
-    if 0 <= idx < len(items) and 0 <= j < len(items):
-        items[idx], items[j] = items[j], items[idx]
+def move_item(i: int, d: int):
+    lst = st.session_state.file_list
+    j = i + d
+    if 0 <= i < len(lst) and 0 <= j < len(lst):
+        lst[i], lst[j] = lst[j], lst[i]
 
 
-def remove_item(idx: int):
-    items = st.session_state.file_list
-    if 0 <= idx < len(items):
-        items.pop(idx)
+def remove_item(i: int):
+    lst = st.session_state.file_list
+    if 0 <= i < len(lst):
+        lst.pop(i)
 
 
 def clear_all():
     st.session_state.file_list = []
 
 
+# -----------------
+# UI
+# -----------------
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     init_state()
@@ -344,126 +257,112 @@ def main():
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 2.2rem; padding-bottom: 2.2rem; max-width: 1080px; }
-        h1 { font-size: 34px !important; font-weight: 650 !important; letter-spacing:-0.02em; }
-        .subtle { color: rgba(255,255,255,0.70); font-size: 14px; line-height: 1.55; }
-        .card { border: 1px solid rgba(255,255,255,0.10); border-radius: 16px; padding: 16px; background: rgba(255,255,255,0.03); }
-        .tiny { font-size: 12px; color: rgba(255,255,255,0.65); line-height: 1.45; }
+        .block-container { max-width: 1040px; padding-top: 2.0rem; padding-bottom: 2.0rem; }
+        h1 { font-size: 30px !important; font-weight: 600 !important; letter-spacing:-0.02em; }
+        h2,h3,h4 { font-weight: 600 !important; }
+        .muted { color: rgba(255,255,255,0.70); font-size: 13px; line-height: 1.6; }
+        .card { border:1px solid rgba(255,255,255,0.10); border-radius:14px; padding:14px 16px; background: rgba(255,255,255,0.03); }
+        .tiny { font-size: 11px; color: rgba(255,255,255,0.60); line-height: 1.55; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
     st.title("MISHARP 상세페이지 생성기")
-    st.markdown(
-        "<div class='subtle'>여러 장 이미지를 업로드 → <b>상세페이지 JPG</b>와 <b>PSD 패키지(6장 단위 자동 분할)</b>를 생성합니다.</div>",
-        unsafe_allow_html=True,
+    st.markdown("<div class='muted'>여러 장 업로드 → <b>상세페이지 JPG</b> + <b>PSD 패키지(6장 단위 자동분할)</b></div>", unsafe_allow_html=True)
+
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+
+    # ✅ 파일명 입력칸 복구
+    base_name = st.text_input("파일명(상품명) — 출력 파일명에 사용", value="misharp_detailpage")
+    base_name = clean_filename(base_name)
+
+    st.markdown("#### 1) 파일 업로드")
+    uploaded = st.file_uploader(
+        "JPG/PNG/WEBP/GIF 등 여러 장 업로드 (개수 제한 없음)",
+        accept_multiple_files=True,
+        type=None,
+        label_visibility="collapsed",
     )
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("업로드 목록에 추가", use_container_width=True):
+            add_files(uploaded)
+    with c2:
+        if st.button("목록 전체 비우기", use_container_width=True, disabled=(len(st.session_state.file_list) == 0)):
+            clear_all()
 
-    with st.container():
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("#### 2) 여백 설정")
+    gap = st.number_input("이미지들 간 여백(px)", min_value=0, max_value=2000, value=DEFAULT_GAP, step=10)
+    top = st.number_input("상단 여백(px)", min_value=0, max_value=5000, value=DEFAULT_TOP, step=10)
+    bottom = st.number_input("하단 여백(px)", min_value=0, max_value=5000, value=DEFAULT_BOTTOM, step=10)
 
-        colA, colB = st.columns([1.1, 0.9], gap="large")
+    st.markdown("<div class='tiny'>기본값: 이미지 간격 300px / 상·하단 300px · 6장 초과 시 PSD 자동 분할(A안)</div>", unsafe_allow_html=True)
 
-        with colA:
-            st.markdown("#### 1) 파일 업로드")
-            uploaded = st.file_uploader(
-                "JPG/PNG/WEBP/GIF 등 여러 장 업로드 (개수 제한 없음)",
-                accept_multiple_files=True,
-                type=None,
-                label_visibility="collapsed",
-            )
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if st.button("업로드 목록에 추가", use_container_width=True):
-                    add_files(uploaded)
-            with c2:
-                if st.button(
-                    "목록 전체 비우기",
-                    use_container_width=True,
-                    disabled=(len(st.session_state.file_list) == 0),
-                ):
-                    clear_all()
+    st.markdown("</div>", unsafe_allow_html=True)
 
-            st.markdown("#### 2) 여백 설정")
-            gap = st.number_input("이미지 사이 간격(px)", min_value=0, max_value=2000, value=DEFAULT_GAP, step=10)
-            top = st.number_input("상단 여백(px)", min_value=0, max_value=5000, value=DEFAULT_TOP_BOTTOM, step=10)
-            bottom = st.number_input("하단 여백(px)", min_value=0, max_value=5000, value=DEFAULT_TOP_BOTTOM, step=10)
+    st.markdown("#### 3) 업로드 목록 (순서 조정)")
+    if len(st.session_state.file_list) == 0:
+        st.info("업로드 후 ‘업로드 목록에 추가’를 눌러주세요.")
+    else:
+        for idx, it in enumerate(st.session_state.file_list):
+            colL, colR = st.columns([0.18, 0.82], gap="small")
+            with colL:
+                up = st.button("↑", key=f"up_{idx}", disabled=(idx == 0))
+                dn = st.button("↓", key=f"dn_{idx}", disabled=(idx == len(st.session_state.file_list) - 1))
+                rm = st.button("삭제", key=f"rm_{idx}")
+                if up:
+                    move_item(idx, -1); st.rerun()
+                if dn:
+                    move_item(idx, +1); st.rerun()
+                if rm:
+                    remove_item(idx); st.rerun()
 
-            st.markdown(
-                "<div class='tiny'>※ PSD는 6장 단위로 자동 분할되어 Photoshop 한계를 안정적으로 회피합니다.</div>",
-                unsafe_allow_html=True,
-            )
+            with colR:
+                st.markdown(f"**{idx+1:02d}.** {it['name']}")
+                if is_image(it["name"]):
+                    try:
+                        im = open_image_bytes(it["data"])
+                        st.image(rgba_to_rgb_white(im), use_container_width=True)
+                    except Exception:
+                        st.caption("미리보기 불가 (이미지 손상/형식 문제 가능)")
+                else:
+                    st.caption("이미지 외 파일(참고용) — 상세페이지 JPG/PSD엔 포함되지 않음")
 
-        with colB:
-            st.markdown("#### 업로드된 목록 (순서 조정)")
-            if len(st.session_state.file_list) == 0:
-                st.info("아직 목록이 비어 있어요. 업로드 후 ‘업로드 목록에 추가’를 눌러주세요.")
-            else:
-                for idx, it in enumerate(st.session_state.file_list):
-                    row = st.columns([0.18, 0.82], gap="small")
-                    with row[0]:
-                        up = st.button("↑", key=f"up_{idx}", disabled=(idx == 0))
-                        dn = st.button("↓", key=f"dn_{idx}", disabled=(idx == len(st.session_state.file_list) - 1))
-                        rm = st.button("삭제", key=f"rm_{idx}")
-                        if up:
-                            move_item(idx, -1)
-                            st.rerun()
-                        if dn:
-                            move_item(idx, +1)
-                            st.rerun()
-                        if rm:
-                            remove_item(idx)
-                            st.rerun()
+    st.markdown("### 4) 생성")
 
-                    with row[1]:
-                        st.markdown(f"**{idx+1:02d}.** {it['name']}")
-                        if _is_image_filename(it["name"]):
-                            try:
-                                img = _open_image_bytes(it["data"])
-                                st.image(_to_rgb_on_white(img), use_container_width=True)
-                            except Exception:
-                                st.caption("미리보기 불가 (이미지 손상 또는 형식 문제)")
-                        else:
-                            st.caption("이미지 외 파일 — PSD/JPG 생성에는 포함되지 않습니다.")
+    items = [(it["name"], it["data"]) for it in st.session_state.file_list]
+    can_run = any(is_image(n) for n, _ in items)
 
-        st.markdown("</div>", unsafe_allow_html=True)
+    colA, colB = st.columns([1, 1], gap="large")
+    with colA:
+        make_jpg_flag = st.checkbox("상세페이지 JPG 생성", value=True)
+    with colB:
+        make_zip_flag = st.checkbox("PSD 패키지 ZIP 생성(JSX 포함)", value=True)
 
-    st.markdown("### 3) 생성")
-
-    can_run = any(_is_image_filename(it["name"]) for it in st.session_state.file_list)
-
-    colX, colY = st.columns([1, 1], gap="large")
-    with colX:
-        make_jpg = st.checkbox("상세페이지 JPG 생성", value=True)
-    with colY:
-        make_psd_package = st.checkbox("PSD 패키지 ZIP 생성 (Photoshop JSX 포함)", value=True)
-
-    if st.button("생성하기", type="primary", use_container_width=True, disabled=(not can_run)):
+    if st.button("생성하기", type="primary", use_container_width=True, disabled=not can_run):
         try:
-            items = [(it["name"], it["data"]) for it in st.session_state.file_list]
-
-            if make_jpg:
-                jpg_bytes = _make_stacked_jpg(items, gap=int(gap), top=int(top), bottom=int(bottom), bg_rgb=DEFAULT_BG)
+            if make_jpg_flag:
+                jpg_bytes = make_stacked_jpg(items, int(gap), int(top), int(bottom))
                 st.download_button(
                     "📥 상세페이지 JPG 다운로드",
                     data=jpg_bytes,
-                    file_name="misharp_detailpage.jpg",
+                    file_name=f"{base_name}.jpg",
                     mime="image/jpeg",
                     use_container_width=True,
                 )
 
-            if make_psd_package:
-                zip_bytes = _zip_package(items, gap=int(gap), top=int(top), bottom=int(bottom))
+            if make_zip_flag:
+                zip_bytes = make_zip_package(items, int(gap), int(top), int(bottom), base_name)
                 st.download_button(
-                    "📥 PSD 패키지 ZIP 다운로드 (JSX 포함)",
+                    "📥 PSD 패키지 ZIP 다운로드 (misharp_detailpage.jsx 포함)",
                     data=zip_bytes,
-                    file_name="misharp_detailpage_package.zip",
+                    file_name=f"{base_name}_psd_package.zip",
                     mime="application/zip",
                     use_container_width=True,
                 )
 
-            st.success("완료! 위 버튼으로 다운로드하세요.")
+            st.success("완료! 다운로드 버튼으로 받아가세요.")
 
         except Exception as e:
             st.error(f"생성 중 오류: {e}")
