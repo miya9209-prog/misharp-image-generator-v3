@@ -1,24 +1,15 @@
 #target photoshop
 app.displayDialogs = DialogModes.NO;
 
-/*
-MISHARP 상세페이지 생성기 (CS6 완전 호환)
-- images 폴더 내 이미지를 자동 로드
-- 가로 900px 고정 / 비율 유지
-- 모든 이미지 Smart Object
-- 이미지 사이 여백 / 상단·하단 여백
-- 하단 카피라이트 텍스트 레이어
-- JSON / job.json / 설정 파일 ❌
-*/
-
 (function () {
 
-    // ===== 미샵 고정값 =====
+    // ====== 미샵 기본값(고정) ======
     var CANVAS_WIDTH = 900;
     var TOP_MARGIN = 80;
     var GAP = 70;
     var BOTTOM_MARGIN = 120;
 
+    var FOOTER_ENABLED = true;
     var FOOTER_TEXT = "© MISHARP. All rights reserved.  |  misharp.co.kr";
     var FOOTER_FONT = "MalgunGothic";
     var FOOTER_SIZE = 18;
@@ -29,7 +20,7 @@ MISHARP 상세페이지 생성기 (CS6 완전 호환)
 
     function getImageFiles(folder) {
         var files = folder.getFiles(function (f) {
-            return f instanceof File && f.name.match(/\.(jpg|jpeg|png)$/i);
+            return (f instanceof File) && f.name.match(/\.(jpg|jpeg|png)$/i) && f.name.indexOf("._") !== 0;
         });
         files.sort(function (a, b) { return a.name > b.name ? 1 : -1; });
         return files;
@@ -44,6 +35,7 @@ MISHARP 상세페이지 생성기 (CS6 완전 호환)
     }
 
     function placeSmartObject(file) {
+        // Place Embedded => Smart Object 레이어
         var desc = new ActionDescriptor();
         desc.putPath(charIDToTypeID("null"), file);
         desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa"));
@@ -54,6 +46,7 @@ MISHARP 상세페이지 생성기 (CS6 완전 호환)
     function resizeToWidth(layer, targetW) {
         var b = layer.bounds;
         var w = b[2].as("px") - b[0].as("px");
+        if (w <= 0.01) return;
         var scale = (targetW / w) * 100;
         layer.resize(scale, scale, AnchorPosition.TOPLEFT);
     }
@@ -63,37 +56,54 @@ MISHARP 상세페이지 생성기 (CS6 완전 호환)
         layer.translate(x - b[0].as("px"), y - b[1].as("px"));
     }
 
-    // ===== 시작 =====
-    var baseFolder = File($.fileName).parent;
-    var imgFolder = new Folder(baseFolder + "/images");
+    function addFooter(doc, y) {
+        if (!FOOTER_ENABLED) return;
 
-    if (!imgFolder.exists) {
-        alert("images 폴더를 찾을 수 없습니다.\nJSX와 같은 위치에 images 폴더가 필요합니다.");
-        return;
+        var textLayer = doc.artLayers.add();
+        textLayer.kind = LayerKind.TEXT;
+        textLayer.name = "copyright";
+
+        var ti = textLayer.textItem;
+        ti.contents = FOOTER_TEXT;
+        ti.size = FOOTER_SIZE;
+        try { ti.font = FOOTER_FONT; } catch (e) {}
+
+        ti.color.rgb.red = FOOTER_COLOR[0];
+        ti.color.rgb.green = FOOTER_COLOR[1];
+        ti.color.rgb.blue = FOOTER_COLOR[2];
+
+        ti.justification = Justification.CENTER;
+        ti.position = [px(CANVAS_WIDTH / 2), px(y + FOOTER_SIZE * 2)];
     }
+
+    // ====== 여기서부터 “그때 방식” ======
+    // JSX 실행하면 이미지 폴더만 선택 -> 바로 PSD 생성
+    var imgFolder = Folder.selectDialog("images 폴더를 선택하세요 (JPG/PNG가 들어있는 폴더)");
+    if (!imgFolder) return;
 
     var images = getImageFiles(imgFolder);
     if (images.length === 0) {
-        alert("images 폴더에 이미지가 없습니다.");
+        alert("선택한 폴더에 이미지(JPG/PNG)가 없습니다.");
         return;
     }
 
     // 전체 높이 계산
-    var totalH = TOP_MARGIN + BOTTOM_MARGIN + FOOTER_MARGIN_TOP + FOOTER_SIZE * 2.2;
-    var heights = [];
-
+    var totalImagesH = 0;
+    var scaledHeights = [];
     for (var i = 0; i < images.length; i++) {
         var s = getSize(images[i]);
         var h = Math.round(s.h * (CANVAS_WIDTH / s.w));
-        heights.push(h);
-        totalH += h;
-        if (i < images.length - 1) totalH += GAP;
+        scaledHeights.push(h);
+        totalImagesH += h;
     }
+
+    var footerH = FOOTER_ENABLED ? (FOOTER_MARGIN_TOP + Math.round(FOOTER_SIZE * 2.2) + 12) : 0;
+    var canvasH = TOP_MARGIN + totalImagesH + GAP * (images.length - 1) + BOTTOM_MARGIN + footerH;
 
     // PSD 생성
     var doc = app.documents.add(
         px(CANVAS_WIDTH),
-        px(totalH),
+        px(canvasH),
         72,
         "misharp_detailpage",
         NewDocumentMode.RGB,
@@ -102,6 +112,7 @@ MISHARP 상세페이지 생성기 (CS6 완전 호환)
 
     var y = TOP_MARGIN;
 
+    // 이미지 배치(모두 Smart Object)
     for (var j = 0; j < images.length; j++) {
         placeSmartObject(images[j]);
         var layer = doc.activeLayer;
@@ -110,25 +121,15 @@ MISHARP 상세페이지 생성기 (CS6 완전 호환)
         resizeToWidth(layer, CANVAS_WIDTH);
         moveLayer(layer, 0, y);
 
-        y += heights[j] + GAP;
+        y += scaledHeights[j] + GAP;
     }
 
     // 카피라이트
-    y += FOOTER_MARGIN_TOP;
-    var textLayer = doc.artLayers.add();
-    textLayer.kind = LayerKind.TEXT;
-    textLayer.name = "copyright";
+    if (FOOTER_ENABLED) {
+        y += FOOTER_MARGIN_TOP;
+        addFooter(doc, y);
+    }
 
-    var ti = textLayer.textItem;
-    ti.contents = FOOTER_TEXT;
-    ti.size = FOOTER_SIZE;
-    try { ti.font = FOOTER_FONT; } catch (e) {}
-    ti.color.rgb.red = FOOTER_COLOR[0];
-    ti.color.rgb.green = FOOTER_COLOR[1];
-    ti.color.rgb.blue = FOOTER_COLOR[2];
-    ti.justification = Justification.CENTER;
-    ti.position = [px(CANVAS_WIDTH / 2), px(y + FOOTER_SIZE * 2)];
-
-    alert("완료!\nSmart Object PSD가 생성되었습니다.");
+    alert("완료!\nSmart Object 레이어가 살아있는 PSD가 생성되었습니다.");
 
 })();
