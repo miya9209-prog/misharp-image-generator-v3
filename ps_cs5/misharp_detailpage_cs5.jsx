@@ -156,4 +156,3 @@
     }
 
 })();
-fix: CS5 error 1302 (no activeDocument) + stable silent run
