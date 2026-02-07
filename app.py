@@ -25,7 +25,7 @@ This program is for internal use by misharpcompany employees only and must not b
 
 
 # =========================
-# Config
+# Page Config
 # =========================
 st.set_page_config(page_title="MISHARP 상세페이지 생산기 v3.1", layout="wide")
 
@@ -82,7 +82,6 @@ def open_image_any(upload_bytes: bytes) -> Image.Image:
 
 
 def resize_to_width(img: Image.Image, width: int) -> Image.Image:
-    # 비율 유지
     w, h = img.size
     if w == width:
         return img
@@ -108,11 +107,12 @@ def composite_detail_jpg(
 
     for name, data in items:
         img = open_image_any(data)
+
         # 투명 처리 → 흰 배경 합성
         if img.mode == "RGBA":
-            base = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            base.alpha_composite(img)
-            img = base.convert("RGB")
+            base_rgba = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            base_rgba.alpha_composite(img)
+            img = base_rgba.convert("RGB")
         else:
             img = img.convert("RGB")
 
@@ -129,15 +129,7 @@ def composite_detail_jpg(
     placements = []
     for idx, (name, img) in enumerate(resized_images, start=1):
         canvas.paste(img, (0, y))
-        placements.append(
-            {
-                "index": idx,
-                "filename": name,
-                "y": y,
-                "w": width,
-                "h": img.size[1],
-            }
-        )
+        placements.append({"index": idx, "filename": name, "y": y, "w": width, "h": img.size[1]})
         y += img.size[1] + gap
 
     buf = io.BytesIO()
@@ -164,30 +156,46 @@ class Item:
 
 
 def ensure_state():
-    if "items" not in st.session_state:
-        st.session_state.items = []
+    # 반드시 최상단에서 실행되어야 함
+    if "items" not in st.session_state or st.session_state.get("items") is None:
+        st.session_state["items"] = []
+
+
+def get_items() -> List[Item]:
+    items = st.session_state.get("items", [])
+    if items is None:
+        items = []
+        st.session_state["items"] = items
+    return items
 
 
 def add_files(files):
+    items = get_items()
     for f in files:
+        # 상세페이지는 이미지들로 구성 (psd/gif 등은 별도 요구 없어서 일단 제외)
         if not is_image(f.name):
-            # 이미지 외 파일은 여기서 제외 (요구: 여러 JPG로 상세페이지)
-            # 필요하면 첨부파일 섹션을 별도로 만들 수 있음
             continue
-        st.session_state.items.append(Item(name=f.name, data=f.getvalue()))
+        items.append(Item(name=f.name, data=f.getvalue()))
+    st.session_state["items"] = items
 
 
 def move_item(i: int, d: int):
-    items: List[Item] = st.session_state.items
+    items = get_items()
     j = i + d
     if 0 <= i < len(items) and 0 <= j < len(items):
         items[i], items[j] = items[j], items[i]
+    st.session_state["items"] = items
 
 
 def delete_item(i: int):
-    items: List[Item] = st.session_state.items
+    items = get_items()
     if 0 <= i < len(items):
         items.pop(i)
+    st.session_state["items"] = items
+
+
+def clear_items():
+    st.session_state["items"] = []
 
 
 # =========================
@@ -196,7 +204,7 @@ def delete_item(i: int):
 ensure_state()
 
 st.title("MISHARP 상세페이지 생산기 v3.1")
-st.caption("여러 장 JPG → (여백룰 적용) 1장 JPG 생성 + (Smart Object PSD는 Photoshop JSX로 생성)")
+st.caption("여러 장 이미지 → (여백룰 적용) 1장 JPG 생성 + (Smart Object PSD는 Photoshop JSX로 생성)")
 
 left, right = st.columns([1.05, 0.95], gap="large")
 
@@ -207,13 +215,18 @@ with left:
         accept_multiple_files=True,
         type=None,
     )
+
+    items_now = get_items()
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("업로드 목록에 추가", type="primary", disabled=not uploaded):
             add_files(uploaded)
+            st.rerun()
     with c2:
-        if st.button("목록 전체 비우기", disabled=(len(st.session_state.items) == 0)):
-            st.session_state.items = []
+        # ⭐️ 여기서 session_state 직접 참조하지 않음 (TypeError 방지)
+        if st.button("목록 전체 비우기", disabled=(len(items_now) == 0)):
+            clear_items()
+            st.rerun()
 
     st.divider()
     st.subheader("2) 상세페이지 룰(여백 설정)")
@@ -226,12 +239,14 @@ with left:
 
 with right:
     st.subheader("3) 미리보기 / 순서 변경 / 삭제")
-    items: List[Item] = st.session_state.items
-    if not items:
+    items_now = get_items()
+
+    if not items_now:
         st.write("왼쪽에서 업로드 후 **업로드 목록에 추가**를 눌러주세요.")
     else:
-        for i, it in enumerate(items):
+        for i, it in enumerate(items_now):
             cols = st.columns([0.22, 0.48, 0.10, 0.10, 0.10])
+
             with cols[0]:
                 try:
                     thumb = open_image_any(it.data)
@@ -241,25 +256,27 @@ with right:
                     st.image(tb.getvalue(), use_container_width=True)
                 except Exception:
                     st.write("IMG")
+
             with cols[1]:
                 st.write(f"**{i+1}. {it.name}**")
                 st.caption(f"{len(it.data):,} bytes")
+
             with cols[2]:
                 st.button("↑", key=f"up_{i}", on_click=move_item, args=(i, -1), disabled=(i == 0))
             with cols[3]:
-                st.button("↓", key=f"down_{i}", on_click=move_item, args=(i, +1), disabled=(i == len(items)-1))
+                st.button("↓", key=f"down_{i}", on_click=move_item, args=(i, +1), disabled=(i == len(items_now) - 1))
             with cols[4]:
                 st.button("🗑", key=f"del_{i}", on_click=delete_item, args=(i,))
 
 st.divider()
 st.subheader("4) 결과물 생성")
 
-items: List[Item] = st.session_state.items
+items_now = get_items()
 base = safe_name(base_name)
 
-if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="primary", disabled=(len(items) == 0)):
-    # 1) JPG 합성
-    img_list = [(it.name, it.data) for it in items]
+gen_disabled = (len(items_now) == 0)
+if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="primary", disabled=gen_disabled):
+    img_list = [(it.name, it.data) for it in items_now]
     detail_jpg, meta = composite_detail_jpg(
         img_list,
         width=int(width),
@@ -268,7 +285,6 @@ if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="prim
         bottom=int(bottom),
     )
 
-    # 2) job.json (JSX가 그대로 PSD 만들 수 있게 placements 포함)
     job = {
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "layout": {
@@ -283,7 +299,6 @@ if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="prim
             {
                 "index": p["index"],
                 "original_filename": p["filename"],
-                # ZIP 안에서 JSX가 안정적으로 찾을 수 있게 정규화 파일명도 제공
                 "zip_filename": f"images/image_{p['index']:03d}.jpg",
                 "y": int(p["y"]),
                 "w": int(p["w"]),
@@ -300,41 +315,33 @@ if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="prim
     }
     job_bytes = json.dumps(job, ensure_ascii=False, indent=2).encode("utf-8")
 
-    # 3) ZIP 패키지 만들기
     zip_buf = io.BytesIO()
     jsx_bytes = load_jsx_bytes()
 
     with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        # 최종 jpg
         z.writestr(f"{base}.jpg", detail_jpg)
-
-        # job.json
         z.writestr("job.json", job_bytes)
 
-        # images/ 정규화된 jpg로 넣기 (포토샵 안정성)
-        for idx, it in enumerate(items, start=1):
+        # images/ 정규화된 JPG로 넣기
+        for idx, it in enumerate(items_now, start=1):
             img = open_image_any(it.data)
-            # 투명 → 흰 배경 합성 후 JPG 저장
             if img.mode == "RGBA":
                 base_rgba = Image.new("RGBA", img.size, (255, 255, 255, 255))
                 base_rgba.alpha_composite(img)
                 img_rgb = base_rgba.convert("RGB")
             else:
                 img_rgb = img.convert("RGB")
-            img_rgb = resize_to_width(img_rgb, int(width))
 
+            img_rgb = resize_to_width(img_rgb, int(width))
             buf = io.BytesIO()
             img_rgb.save(buf, format="JPEG", quality=95, optimize=True)
             z.writestr(f"images/image_{idx:03d}.jpg", buf.getvalue())
 
-        # JSX 포함
         if jsx_bytes:
             z.writestr("misharp_detailpage.jsx", jsx_bytes)
 
-        # 카피라이트 텍스트도 패키지에 동봉
         z.writestr("COPYRIGHT.txt", (COPYRIGHT_KR + "\n\n" + COPYRIGHT_EN).encode("utf-8"))
 
-    # 4) 화면 표시 + 다운로드 버튼
     st.success("생성 완료! 아래에서 JPG와 ZIP을 다운로드하세요.")
     st.image(detail_jpg, caption=f"{base}.jpg (여백룰 적용)", use_container_width=True)
 
@@ -357,7 +364,7 @@ if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="prim
 1) ZIP을 풀어 폴더에 `job.json`, `images/` 폴더가 있는지 확인  
 2) 포토샵 → **파일 > 스크립트 > 찾아보기…** → `misharp_detailpage.jsx` 실행  
 3) **ZIP을 푼 폴더**를 선택  
-4) 같은 폴더에 `output.psd`, `output.jpg` 생성
+4) 같은 폴더(또는 선택한 폴더)에 `output.psd`, `output.jpg` 생성
 """
     )
 
