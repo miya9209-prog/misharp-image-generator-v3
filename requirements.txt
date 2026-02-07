@@ -1,2 +1,4 @@
 streamlit==1.42.2
 Pillow==11.1.0
+psd-tools==1.9.28
+numpy==2.2.2
