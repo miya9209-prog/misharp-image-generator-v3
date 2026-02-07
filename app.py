@@ -2,386 +2,599 @@ import io
 import os
 import re
 import json
+import math
+import shutil
 import zipfile
+import tempfile
+from datetime import datetime
 from typing import List, Tuple
 
 import streamlit as st
 from PIL import Image
 
-# -----------------
-# 기본값 (A안)
-# -----------------
-APP_TITLE = "MISHARP 상세페이지 생성기 v3.3"
-MAX_PER_PSD = 6
-DEFAULT_GAP = 300
-DEFAULT_TOP = 300
-DEFAULT_BOTTOM = 300
-DEFAULT_BG = (255, 255, 255)
-
-Image.MAX_IMAGE_PIXELS = None
+# =========================
+# Utilities
+# =========================
+IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 
 
-# -----------------
-# 유틸
-# -----------------
-def clean_filename(name: str) -> str:
-    name = (name or "").strip()
-    name = re.sub(r"[^\w\-.()가-힣 ]+", "_", name)
+def sanitize_name(name: str) -> str:
+    name = re.sub(r"[^\w\-.가-힣 ]+", "_", name).strip()
     name = re.sub(r"\s+", " ", name)
-    return name or "misharp"
+    return name[:120] if name else "misharp_detailpage"
 
 
-def is_image(name: str) -> bool:
-    ext = os.path.splitext(name.lower())[1]
-    return ext in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]
+def natural_key(s: str):
+    # natural sort: image_2 < image_10
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
-def open_image_bytes(data: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(data))
-    if getattr(img, "is_animated", False):
-        img.seek(0)
-    return img.convert("RGBA")
+def list_images_recursive(root_dir: str) -> List[str]:
+    """Find images recursively. Fixes ZIP structures like images/images/..."""
+    out = []
+    for base, dirs, files in os.walk(root_dir):
+        # skip junk
+        dirs[:] = [d for d in dirs if d not in ("__MACOSX", ".git", ".svn")]
+        for fn in files:
+            if fn.lower().endswith(IMG_EXTS) and not fn.startswith("._"):
+                out.append(os.path.join(base, fn))
+    out.sort(key=lambda p: natural_key(os.path.basename(p)))
+    return out
 
 
-def rgba_to_rgb_white(img_rgba: Image.Image, bg=(255, 255, 255)) -> Image.Image:
-    bg_img = Image.new("RGBA", img_rgba.size, bg + (255,))
-    bg_img.alpha_composite(img_rgba)
-    return bg_img.convert("RGB")
-
-
-def make_stacked_jpg(images: List[Tuple[str, bytes]], gap: int, top: int, bottom: int) -> bytes:
-    pil = []
-    sizes = []
-    max_w = 0
-
-    for n, b in images:
-        if not is_image(n):
-            continue
-        im = open_image_bytes(b)
-        w, h = im.size
-        max_w = max(max_w, w)
-        pil.append(im)
-        sizes.append((w, h))
-
-    if not pil:
-        raise ValueError("이미지(JPG/PNG/WEBP/GIF 등)를 1개 이상 올려주세요.")
-
-    total_h = top + bottom + sum(h for _, h in sizes) + gap * (len(sizes) - 1)
-    canvas = Image.new("RGB", (max_w, total_h), DEFAULT_BG)
-
-    y = top
-    for im, (w, h) in zip(pil, sizes):
-        x = (max_w - w) // 2
-        rgb = rgba_to_rgb_white(im, DEFAULT_BG)
-        canvas.paste(rgb, (x, y))
-        y += h + gap
-
-    out = io.BytesIO()
-    canvas.save(out, format="JPEG", quality=95, optimize=True)
-    return out.getvalue()
-
-
-def build_jobs(images: List[Tuple[str, bytes]], gap: int, top: int, bottom: int, base_name: str):
-    only = [(n, b) for n, b in images if is_image(n)]
-    if not only:
-        raise ValueError("이미지(JPG/PNG/WEBP/GIF 등)를 1개 이상 올려주세요.")
-
-    # 전체 인덱스별 zip 내부 경로
-    image_payloads = []
-    for idx, (n, b) in enumerate(only, start=1):
-        ext = os.path.splitext(n)[1].lower()
-        if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]:
-            ext = ".jpg"
-        image_payloads.append((idx, ext, b))
-
-    jobs = []
-    for start in range(0, len(only), MAX_PER_PSD):
-        chunk = only[start:start + MAX_PER_PSD]
-
-        # 사이즈 산출
-        max_w = 0
-        sizes = []
-        for n, b in chunk:
-            im = open_image_bytes(b)
-            w, h = im.size
-            max_w = max(max_w, w)
-            sizes.append((w, h))
-
-        total_h = top + bottom + sum(h for _, h in sizes) + gap * (len(sizes) - 1)
-
-        # 각 이미지 배치 y 좌표
-        y = top
-        items = []
-        for i, ((n, _), (w, h)) in enumerate(zip(chunk, sizes), start=1):
-            global_idx = start + i
-            ext = os.path.splitext(n)[1].lower()
-            if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"]:
-                ext = ".jpg"
-            items.append({
-                "zip_filename": f"images/image_{global_idx:03d}{ext}",
-                "layer_name": f"IMAGE_{global_idx:03d}",
-                "y": int(y),
-            })
-            y += h + gap
-
-        part_no = (start // MAX_PER_PSD) + 1
-        jobs.append({
-            "version": "misharp_detailpage_job_v3",
-            "base_name": base_name,
-            "part_no": part_no,
-            "layout": {
-                "width": int(max_w),
-                "total_height": int(total_h),
-                "gap": int(gap),
-                "top_margin": int(top),
-                "bottom_margin": int(bottom),
-                "center_align": True,
-            },
-            "images": items,
-        })
-
-    return jobs, image_payloads
-
-
-def load_jsx_from_repo():
-    """
-    repo 루트/tools/misharp_detailpage.jsx 또는 repo 루트/misharp_detailpage.jsx를 우선 사용
-    (없으면 빈 문자열)
-    """
-    candidates = [
-        os.path.join(os.getcwd(), "tools", "misharp_detailpage.jsx"),
-        os.path.join(os.getcwd(), "misharp_detailpage.jsx"),
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as f:
-                return f.read()
-    return ""
-
-
-def make_zip_package(images: List[Tuple[str, bytes]], gap: int, top: int, bottom: int, base_name: str) -> bytes:
-    jobs, image_payloads = build_jobs(images, gap, top, bottom, base_name)
-
-    jsx_text = load_jsx_from_repo()
-    if not jsx_text:
-        raise ValueError("repo에 tools/misharp_detailpage.jsx 파일이 없습니다. (JSX를 먼저 추가해 주세요)")
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        # JSX 루트로
-        z.writestr("misharp_detailpage.jsx", jsx_text)
-
-        # README
-        z.writestr(
-            "README.txt",
-            "\n".join([
-                "MISHARP 상세페이지 패키지",
-                "",
-                "사용법",
-                "1) ZIP 압축 해제",
-                "2) Photoshop 실행",
-                "3) 파일 > 스크립트 > 찾아보기... > misharp_detailpage.jsx 선택",
-                "4) part_01, part_02... 순서대로 PSD가 자동 생성되어 '바로 열립니다'(Smart Object 유지).",
-                "",
-                f"- 기본 이미지 간격: {gap}px",
-                f"- 상단/하단 여백: {top}px / {bottom}px",
-                f"- 6장 초과 시 자동 분할 (A안)",
-                "",
-                "ⓒ misharpcompany. All rights reserved.",
-                "본 프로그램은 미샵컴퍼니 내부 직원 전용입니다.",
-            ])
-        )
-
-        # part 폴더들 + job.json + images
-        for job in jobs:
-            part = f"part_{job['part_no']:02d}"
-            z.writestr(f"{part}/job.json", json.dumps(job, ensure_ascii=False, indent=2).encode("utf-8"))
-
-            # 이 파트가 필요한 이미지 번호만 넣기
-            need_nums = []
-            for it in job["images"]:
-                base = os.path.basename(it["zip_filename"])
-                m = re.search(r"image_(\d+)\.", base, re.IGNORECASE)
-                if m:
-                    need_nums.append(int(m.group(1)))
-            need_set = set(need_nums)
-
-            for idx, ext, data in image_payloads:
-                if idx in need_set:
-                    z.writestr(f"{part}/images/image_{idx:03d}{ext}", data)
-
-    return buf.getvalue()
-
-
-# -----------------
-# Streamlit State
-# -----------------
-def init_state():
-    if "file_list" not in st.session_state:
-        st.session_state.file_list = []
-
-
-def add_files(files):
-    if not files:
-        return
-    for f in files:
-        name = clean_filename(f.name)
-        data = f.getvalue()
-        st.session_state.file_list.append({"name": name, "data": data})
-
-
-def move_item(i: int, d: int):
-    lst = st.session_state.file_list
-    j = i + d
-    if 0 <= i < len(lst) and 0 <= j < len(lst):
-        lst[i], lst[j] = lst[j], lst[i]
-
-
-def remove_item(i: int):
-    lst = st.session_state.file_list
-    if 0 <= i < len(lst):
-        lst.pop(i)
-
-
-def clear_all():
-    st.session_state.file_list = []
-
-
-# -----------------
-# UI
-# -----------------
-def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
-    init_state()
-
-    st.markdown(
-        """
-        <style>
-        .block-container { max-width: 1040px; padding-top: 2.0rem; padding-bottom: 2.0rem; }
-        h1 { font-size: 30px !important; font-weight: 600 !important; letter-spacing:-0.02em; }
-        h2,h3,h4 { font-weight: 600 !important; }
-        .muted { color: rgba(255,255,255,0.70); font-size: 13px; line-height: 1.6; }
-        .card { border:1px solid rgba(255,255,255,0.10); border-radius:14px; padding:14px 16px; background: rgba(255,255,255,0.03); }
-        .tiny { font-size: 11px; color: rgba(255,255,255,0.60); line-height: 1.55; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.title("MISHARP 상세페이지 생성기")
-    st.markdown("<div class='muted'>여러 장 업로드 → <b>상세페이지 JPG</b> + <b>PSD 패키지(6장 단위 자동분할)</b></div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-
-    # ✅ 파일명 입력칸 복구
-    base_name = st.text_input("파일명(상품명) — 출력 파일명에 사용", value="misharp_detailpage")
-    base_name = clean_filename(base_name)
-
-    st.markdown("#### 1) 파일 업로드")
-    uploaded = st.file_uploader(
-        "JPG/PNG/WEBP/GIF 등 여러 장 업로드 (개수 제한 없음)",
-        accept_multiple_files=True,
-        type=None,
-        label_visibility="collapsed",
-    )
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("업로드 목록에 추가", use_container_width=True):
-            add_files(uploaded)
-    with c2:
-        if st.button("목록 전체 비우기", use_container_width=True, disabled=(len(st.session_state.file_list) == 0)):
-            clear_all()
-
-    st.markdown("#### 2) 여백 설정")
-    gap = st.number_input("이미지들 간 여백(px)", min_value=0, max_value=2000, value=DEFAULT_GAP, step=10)
-    top = st.number_input("상단 여백(px)", min_value=0, max_value=5000, value=DEFAULT_TOP, step=10)
-    bottom = st.number_input("하단 여백(px)", min_value=0, max_value=5000, value=DEFAULT_BOTTOM, step=10)
-
-    st.markdown("<div class='tiny'>기본값: 이미지 간격 300px / 상·하단 300px · 6장 초과 시 PSD 자동 분할(A안)</div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("#### 3) 업로드 목록 (순서 조정)")
-    if len(st.session_state.file_list) == 0:
-        st.info("업로드 후 ‘업로드 목록에 추가’를 눌러주세요.")
-    else:
-        for idx, it in enumerate(st.session_state.file_list):
-            colL, colR = st.columns([0.18, 0.82], gap="small")
-            with colL:
-                up = st.button("↑", key=f"up_{idx}", disabled=(idx == 0))
-                dn = st.button("↓", key=f"dn_{idx}", disabled=(idx == len(st.session_state.file_list) - 1))
-                rm = st.button("삭제", key=f"rm_{idx}")
-                if up:
-                    move_item(idx, -1); st.rerun()
-                if dn:
-                    move_item(idx, +1); st.rerun()
-                if rm:
-                    remove_item(idx); st.rerun()
-
-            with colR:
-                st.markdown(f"**{idx+1:02d}.** {it['name']}")
-                if is_image(it["name"]):
-                    try:
-                        im = open_image_bytes(it["data"])
-                        st.image(rgba_to_rgb_white(im), use_container_width=True)
-                    except Exception:
-                        st.caption("미리보기 불가 (이미지 손상/형식 문제 가능)")
-                else:
-                    st.caption("이미지 외 파일(참고용) — 상세페이지 JPG/PSD엔 포함되지 않음")
-
-    st.markdown("### 4) 생성")
-
-    items = [(it["name"], it["data"]) for it in st.session_state.file_list]
-    can_run = any(is_image(n) for n, _ in items)
-
-    colA, colB = st.columns([1, 1], gap="large")
-    with colA:
-        make_jpg_flag = st.checkbox("상세페이지 JPG 생성", value=True)
-    with colB:
-        make_zip_flag = st.checkbox("PSD 패키지 ZIP 생성(JSX 포함)", value=True)
-
-    if st.button("생성하기", type="primary", use_container_width=True, disabled=not can_run):
+def load_images_from_uploads(files) -> List[Tuple[str, Image.Image]]:
+    imgs = []
+    for uf in files:
         try:
-            if make_jpg_flag:
-                jpg_bytes = make_stacked_jpg(items, int(gap), int(top), int(bottom))
-                st.download_button(
-                    "📥 상세페이지 JPG 다운로드",
-                    data=jpg_bytes,
-                    file_name=f"{base_name}.jpg",
-                    mime="image/jpeg",
-                    use_container_width=True,
-                )
-
-            if make_zip_flag:
-                zip_bytes = make_zip_package(items, int(gap), int(top), int(bottom), base_name)
-                st.download_button(
-                    "📥 PSD 패키지 ZIP 다운로드 (misharp_detailpage.jsx 포함)",
-                    data=zip_bytes,
-                    file_name=f"{base_name}_psd_package.zip",
-                    mime="application/zip",
-                    use_container_width=True,
-                )
-
-            st.success("완료! 다운로드 버튼으로 받아가세요.")
-
+            im = Image.open(uf).convert("RGB")
+            imgs.append((uf.name, im))
         except Exception as e:
-            st.error(f"생성 중 오류: {e}")
+            st.warning(f"이미지 로드 실패: {uf.name} ({e})")
+    return imgs
 
-    st.markdown("---")
-    st.markdown(
-        """
-<div class='tiny'>
-ⓒ misharpcompany. All rights reserved.<br/>
-본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.<br/>
-본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.<br/><br/>
-ⓒ misharpcompany. All rights reserved.<br/>
-This program is the intellectual property of misharpcompany. Unauthorized copying, distribution, or use is strictly prohibited.<br/>
-This program is for internal use by misharpcompany employees only and must not be disclosed or shared externally.
-</div>
-        """,
-        unsafe_allow_html=True,
+
+def extract_zip_to_temp(zip_file) -> Tuple[str, List[str]]:
+    tmp = tempfile.mkdtemp(prefix="misharp_zip_")
+    zpath = os.path.join(tmp, "upload.zip")
+    with open(zpath, "wb") as f:
+        f.write(zip_file.getbuffer())
+    try:
+        with zipfile.ZipFile(zpath, "r") as z:
+            z.extractall(tmp)
+    except Exception as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError(f"ZIP 해제 실패: {e}") from e
+
+    img_paths = list_images_recursive(tmp)
+    return tmp, img_paths
+
+
+def pil_resize_to_width_keep_ratio(im: Image.Image, target_w: int) -> Image.Image:
+    w, h = im.size
+    if w == target_w:
+        return im
+    scale = target_w / float(w)
+    new_h = max(1, int(round(h * scale)))
+    return im.resize((target_w, new_h), Image.Resampling.LANCZOS)
+
+
+def compose_vertical_jpg(
+    images: List[Tuple[str, Image.Image]],
+    target_w: int,
+    top_margin: int,
+    bottom_margin: int,
+    gap: int,
+    bg_color=(255, 255, 255),
+    add_footer: bool = False,
+    footer_text: str = "",
+    footer_font_size_px: int = 22,
+    footer_margin_top: int = 24,
+):
+    """
+    IMPORTANT: '이미지 변형/잘라내기 금지' 조건에 부합:
+    - 비율 유지 리사이즈(가로만 900 맞춤)
+    - 크롭 없음
+    - 보정 없음
+    """
+    resized = []
+    for name, im in images:
+        rim = pil_resize_to_width_keep_ratio(im, target_w)
+        resized.append((name, rim))
+
+    total_h = top_margin + bottom_margin
+    if resized:
+        total_h += sum(im.size[1] for _, im in resized)
+        total_h += gap * (len(resized) - 1)
+
+    footer_h = 0
+    if add_footer and footer_text.strip():
+        # 간단 계산(대략): 실제 폰트 렌더링은 PSD에서 더 정확
+        # JPG에는 footer를 "영역만 확보"하고, 텍스트는 PSD에서 편집 가능하게 두는 걸 추천.
+        footer_h = footer_margin_top + int(footer_font_size_px * 2.2)
+        total_h += footer_h
+
+    canvas = Image.new("RGB", (target_w, total_h), color=bg_color)
+
+    y = top_margin
+    for _, im in resized:
+        canvas.paste(im, (0, y))
+        y += im.size[1] + gap
+
+    # JPG에 footer를 굳이 "이미지로" 넣는 건 편집성이 떨어져서,
+    # 기본은 PSD에서 텍스트 레이어로 추가하도록 설계.
+    # (원하면 여기서 PIL ImageDraw로 텍스트 찍는 버전도 추가 가능)
+
+    return canvas, resized, total_h, footer_h
+
+
+def make_psd_package(
+    package_base_name: str,
+    ordered_img_paths: List[str],
+    target_w: int,
+    top_margin: int,
+    bottom_margin: int,
+    gap: int,
+    add_footer: bool,
+    footer_text: str,
+    footer_font: str,
+    footer_font_size: int,
+    footer_color_rgb: Tuple[int, int, int],
+    footer_align: str,
+    footer_margin_top: int,
+) -> bytes:
+    """
+    Create a ZIP package:
+    - /images/*.jpg (normalized)
+    - manifest.json
+    - build_psd_smartobject.jsx
+    """
+    tmpdir = tempfile.mkdtemp(prefix="misharp_psd_pkg_")
+    try:
+        images_dir = os.path.join(tmpdir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+
+        # copy images into images_dir with stable names (keep original filename)
+        normalized = []
+        for p in ordered_img_paths:
+            fn = os.path.basename(p)
+            fn2 = sanitize_name(fn)
+            dst = os.path.join(images_dir, fn2)
+            shutil.copy2(p, dst)
+            normalized.append(dst)
+
+        manifest = {
+            "meta": {
+                "app": "MISHARP Detailpage Generator v3 (PSD SmartObject Package)",
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            "layout": {
+                "canvas_width_px": int(target_w),
+                "top_margin_px": int(top_margin),
+                "bottom_margin_px": int(bottom_margin),
+                "gap_px": int(gap),
+            },
+            "footer": {
+                "enabled": bool(add_footer and footer_text.strip()),
+                "text": footer_text.strip(),
+                "font": footer_font.strip(),
+                "font_size_pt": int(footer_font_size),
+                "color_rgb": [int(footer_color_rgb[0]), int(footer_color_rgb[1]), int(footer_color_rgb[2])],
+                "align": footer_align,  # "center" | "left" | "right"
+                "margin_top_px": int(footer_margin_top),
+            },
+            "images": [os.path.join("images", os.path.basename(p)) for p in normalized],
+            "output": {
+                "psd_name": f"{package_base_name}.psd",
+            },
+        }
+
+        with open(os.path.join(tmpdir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        # write jsx
+        jsx_path = os.path.join(tmpdir, "build_psd_smartobject.jsx")
+        with open(jsx_path, "w", encoding="utf-8") as f:
+            f.write(PHOTOHOP_JSX_SCRIPT)
+
+        # zip it
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(tmpdir):
+                for fn in files:
+                    full = os.path.join(root, fn)
+                    rel = os.path.relpath(full, tmpdir)
+                    z.write(full, rel)
+        mem.seek(0)
+        return mem.getvalue()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# =========================
+# Photoshop JSX script (embedded)
+# =========================
+PHOTOHOP_JSX_SCRIPT = r"""#target photoshop
+app.displayDialogs = DialogModes.NO;
+
+function readTextFile(f) {
+    f.encoding = "UTF8";
+    f.open("r");
+    var s = f.read();
+    f.close();
+    return s;
+}
+
+function ensureJSON() {
+    if (typeof JSON === "undefined") {
+        // Minimal JSON polyfill fallback (very small)
+        // Most modern Photoshop ExtendScript already supports JSON.
+        throw new Error("이 Photoshop 버전은 JSON.parse를 지원하지 않습니다. Photoshop을 최신 버전으로 업데이트해주세요.");
+    }
+}
+
+function px(v){ return new UnitValue(v, "px"); }
+
+function getImageSizePx(fileObj) {
+    // Open to read size then close without saving
+    var d = app.open(fileObj);
+    var w = d.width.as("px");
+    var h = d.height.as("px");
+    d.close(SaveOptions.DONOTSAVECHANGES);
+    return {w:w, h:h};
+}
+
+function placeAsSmartObject(fileObj) {
+    // Place Embedded -> creates smart object layer
+    var idPlc = charIDToTypeID("Plc ");
+    var desc = new ActionDescriptor();
+    desc.putPath(charIDToTypeID("null"), fileObj);
+    desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa")); // align center
+    var idOfst = charIDToTypeID("Ofst");
+    var descOfst = new ActionDescriptor();
+    descOfst.putUnitDouble(charIDToTypeID("Hrzn"), charIDToTypeID("#Pxl"), 0.0);
+    descOfst.putUnitDouble(charIDToTypeID("Vrtc"), charIDToTypeID("#Pxl"), 0.0);
+    desc.putObject(idOfst, idOfst, descOfst);
+    executeAction(idPlc, desc, DialogModes.NO);
+    return app.activeDocument.activeLayer;
+}
+
+function layerBoundsPx(lyr){
+    var b = lyr.bounds; // [L,T,R,B]
+    return {
+        L: b[0].as("px"),
+        T: b[1].as("px"),
+        R: b[2].as("px"),
+        B: b[3].as("px"),
+        W: (b[2].as("px") - b[0].as("px")),
+        H: (b[3].as("px") - b[1].as("px"))
+    };
+}
+
+function moveLayerTo(lyr, x, y){
+    // Moves layer so its top-left becomes (x,y) in canvas coordinates
+    var b = layerBoundsPx(lyr);
+    lyr.translate(x - b.L, y - b.T);
+}
+
+function resizeLayerToWidth(lyr, targetW){
+    var b = layerBoundsPx(lyr);
+    if (b.W <= 0.01) return;
+    var pct = (targetW / b.W) * 100.0;
+    lyr.resize(pct, pct, AnchorPosition.TOPLEFT);
+}
+
+function addFooterText(doc, footer, yTop){
+    if (!footer.enabled) return 0;
+
+    var textLayer = doc.artLayers.add();
+    textLayer.kind = LayerKind.TEXT;
+    textLayer.name = "copyright";
+    var ti = textLayer.textItem;
+    ti.contents = footer.text;
+
+    // Font (best-effort). If missing, Photoshop will fallback.
+    try { ti.font = footer.font; } catch(e) {}
+
+    ti.size = footer.font_size_pt; // points
+    ti.color.rgb.red = footer.color_rgb[0];
+    ti.color.rgb.green = footer.color_rgb[1];
+    ti.color.rgb.blue = footer.color_rgb[2];
+
+    // Position: we set x based on align; y is baseline, so add some offset
+    var x;
+    if (footer.align === "left") x = 16;
+    else if (footer.align === "right") x = doc.width.as("px") - 16;
+    else x = doc.width.as("px") / 2;
+
+    // baseline y (rough). We'll put baseline a bit below yTop + fontSize
+    var baselineY = yTop + (footer.font_size_pt * 2.0);
+
+    ti.position = [px(x), px(baselineY)];
+
+    if (footer.align === "center") ti.justification = Justification.CENTER;
+    else if (footer.align === "right") ti.justification = Justification.RIGHT;
+    else ti.justification = Justification.LEFT;
+
+    // Return an estimated footer height in px (safe)
+    return Math.round(footer.font_size_pt * 2.2) + 8;
+}
+
+function main(){
+    ensureJSON();
+
+    // Choose manifest.json
+    var mf = File.openDialog("manifest.json 선택 (PSD 생성용)", "JSON:*.json");
+    if (!mf) return;
+
+    var manifestText = readTextFile(mf);
+    var manifest = JSON.parse(manifestText);
+
+    var baseFolder = mf.parent; // package root
+    var images = manifest.images;
+    if (!images || images.length === 0) throw new Error("manifest에 images가 없습니다.");
+
+    var canvasW = manifest.layout.canvas_width_px;
+    var topMargin = manifest.layout.top_margin_px;
+    var bottomMargin = manifest.layout.bottom_margin_px;
+    var gap = manifest.layout.gap_px;
+
+    var footer = manifest.footer || {enabled:false};
+
+    // Prepass: compute scaled heights
+    var sizes = [];
+    var totalImagesH = 0;
+
+    for (var i=0; i<images.length; i++){
+        var rel = images[i];
+        var f = File(baseFolder.fsName + "/" + rel);
+        if (!f.exists) throw new Error("이미지 파일을 찾을 수 없습니다: " + f.fsName);
+
+        var sz = getImageSizePx(f);
+        var scale = canvasW / sz.w;
+        var scaledH = Math.round(sz.h * scale);
+        sizes.push({file:f, scaledH:scaledH});
+        totalImagesH += scaledH;
+    }
+
+    var canvasH = topMargin + totalImagesH + gap*(images.length-1) + bottomMargin;
+    if (footer.enabled) canvasH += footer.margin_top_px + Math.round(footer.font_size_pt * 2.2) + 12;
+
+    // Create PSD doc
+    var doc = app.documents.add(px(canvasW), px(canvasH), 72, manifest.output.psd_name, NewDocumentMode.RGB, DocumentFill.WHITE);
+    doc.activeLayer.name = "background";
+
+    // Place layers
+    var y = topMargin;
+
+    for (var j=0; j<sizes.length; j++){
+        var f2 = sizes[j].file;
+        placeAsSmartObject(f2); // active layer is placed smart object
+        var lyr = doc.activeLayer;
+        lyr.name = decodeURI(f2.name);
+
+        // resize to width, keep ratio (no crop)
+        resizeLayerToWidth(lyr, canvasW);
+        // move to top-left at (0,y)
+        moveLayerTo(lyr, 0, y);
+
+        // next y
+        var b = layerBoundsPx(lyr);
+        y += Math.round(b.H) + gap;
+    }
+
+    // Footer (text layer) if enabled
+    if (footer.enabled){
+        y += footer.margin_top_px;
+        addFooterText(doc, footer, y);
+    }
+
+    // Save PSD next to manifest
+    var outPSD = File(baseFolder.fsName + "/" + manifest.output.psd_name);
+    var psdSaveOptions = new PhotoshopSaveOptions();
+    psdSaveOptions.embedColorProfile = true;
+    psdSaveOptions.layers = true;
+    doc.saveAs(outPSD, psdSaveOptions, true, Extension.LOWERCASE);
+
+    alert("완료! PSD 생성됨:\n" + outPSD.fsName + "\n\n레이어는 모두 고급개체(스마트 오브젝트)로 살아있습니다.");
+}
+
+try {
+    main();
+} catch(e){
+    alert("오류:\n" + e.toString());
+}
+"""
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="미샵 상세페이지 생성기 v3 (JPG + PSD 패키지)", layout="wide")
+st.title("미샵 상세페이지 생성기 v3 (JPG + PSD 고급개체 PSD 패키지)")
+
+st.markdown(
+    """
+- ✅ **가로 900px 고정**, 세로는 자동(이미지 수에 따라 증가)
+- ✅ **자르기/변형/보정 금지** (비율 유지 리사이즈만)
+- ✅ **이미지 사이 흰 여백**, 최상단/최하단 여백
+- ✅ 업로드: **JPG 여러 장** 또는 **ZIP(자동 해제)**
+- ✅ 출력:
+  - **상세페이지 JPG 1장**
+  - **PSD 패키지(zip)**: `manifest.json + images + build_psd_smartobject.jsx`  
+    → PC Photoshop에서 JSX 실행하면 **고급개체 레이어 살아있는 PSD 생성**
+"""
+)
+
+with st.sidebar:
+    st.header("레이아웃 설정")
+    target_w = st.number_input("캔버스 가로(px)", min_value=600, max_value=1400, value=900, step=10)
+    top_margin = st.number_input("상단 여백(px)", min_value=0, max_value=400, value=80, step=5)
+    gap = st.number_input("이미지 사이 여백(px)", min_value=0, max_value=250, value=70, step=5)
+    bottom_margin = st.number_input("하단 여백(px)", min_value=0, max_value=400, value=120, step=5)
+
+    st.divider()
+    st.header("하단 카피라이트(PSD 텍스트 레이어)")
+    add_footer = st.checkbox("PSD에 카피라이트 텍스트 레이어 추가", value=True)
+    footer_text = st.text_input(
+        "카피라이트 문구",
+        value="© MISHARP. All rights reserved.  |  misharp.co.kr",
     )
+    footer_font = st.text_input("폰트명(없으면 자동 대체)", value="MalgunGothic")
+    footer_font_size = st.number_input("폰트 크기(pt)", min_value=8, max_value=64, value=18, step=1)
+    footer_align = st.selectbox("정렬", ["center", "left", "right"], index=0)
+    footer_margin_top = st.number_input("이미지 끝~카피라이트 위 여백(px)", min_value=0, max_value=200, value=40, step=5)
+
+    st.divider()
+    st.caption("※ JPG 결과물에는 카피라이트를 이미지로 찍지 않고(편집성 ↓), PSD에 텍스트 레이어로 넣습니다.")
 
 
-if __name__ == "__main__":
-    main()
+tab1, tab2 = st.tabs(["JPG 다중 업로드", "ZIP 업로드"])
+
+uploaded_images = []
+base_name = "misharp_detailpage"
+
+with tab1:
+    files = st.file_uploader("JPG/PNG 여러 장 업로드", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True)
+    if files:
+        uploaded_images = load_images_from_uploads(files)
+        if uploaded_images:
+            base_name = sanitize_name(os.path.splitext(uploaded_images[0][0])[0])
+
+with tab2:
+    zf = st.file_uploader("ZIP 업로드 (압축 해제 후 이미지 자동 탐색)", type=["zip"])
+    zip_tmp = None
+    zip_paths = []
+    if zf:
+        try:
+            zip_tmp, zip_paths = extract_zip_to_temp(zf)
+            if zip_paths:
+                # preview: load a few
+                st.success(f"ZIP에서 이미지 {len(zip_paths)}개 발견 (폴더 구조 상관없이 재귀 탐색).")
+                base_name = sanitize_name(os.path.splitext(os.path.basename(zip_paths[0]))[0])
+            else:
+                st.error("ZIP 안에서 이미지 파일을 찾지 못했습니다.")
+        except Exception as e:
+            st.error(str(e))
+
+
+colA, colB = st.columns([1, 1])
+
+with colA:
+    st.subheader("미리보기 / 순서")
+    if uploaded_images:
+        st.write(f"업로드 이미지: {len(uploaded_images)}개")
+        names = [n for n, _ in uploaded_images]
+        st.code("\n".join(names[:80]) + ("\n..." if len(names) > 80 else ""))
+        st.image([im for _, im in uploaded_images[:6]], caption=[n for n, _ in uploaded_images[:6]], width=240)
+    elif zip_paths:
+        st.write(f"ZIP 이미지: {len(zip_paths)}개")
+        st.code("\n".join([os.path.basename(p) for p in zip_paths[:80]]) + ("\n..." if len(zip_paths) > 80 else ""))
+    else:
+        st.info("이미지를 업로드하면 미리보기와 출력 버튼이 활성화됩니다.")
+
+with colB:
+    st.subheader("출력")
+
+    if (uploaded_images and len(uploaded_images) > 0) or (zip_paths and len(zip_paths) > 0):
+        # Build JPG
+        if st.button("✅ 상세페이지 JPG 생성", use_container_width=True):
+            if uploaded_images:
+                images = uploaded_images
+            else:
+                # load from zip paths
+                images = []
+                for p in zip_paths:
+                    try:
+                        im = Image.open(p).convert("RGB")
+                        images.append((os.path.basename(p), im))
+                    except Exception as e:
+                        st.warning(f"이미지 로드 실패: {p} ({e})")
+                # base_name from first file
+                if images:
+                    base_name = sanitize_name(os.path.splitext(images[0][0])[0])
+
+            if not images:
+                st.error("유효한 이미지가 없습니다.")
+            else:
+                canvas, resized, total_h, footer_h = compose_vertical_jpg(
+                    images=images,
+                    target_w=int(target_w),
+                    top_margin=int(top_margin),
+                    bottom_margin=int(bottom_margin),
+                    gap=int(gap),
+                    add_footer=False,  # footer is PSD text layer, not burned into JPG by default
+                )
+                out = io.BytesIO()
+                canvas.save(out, format="JPEG", quality=95, optimize=True)
+                out.seek(0)
+
+                out_name = f"{base_name}_detail_{int(target_w)}w.jpg"
+                st.success(f"완료! 최종 크기: {int(target_w)} x {total_h}px")
+                st.download_button("⬇️ JPG 다운로드", data=out.getvalue(), file_name=out_name, mime="image/jpeg")
+
+        # Build PSD Package
+        st.divider()
+        if st.button("✅ PSD 패키지(zip) 생성 (고급개체 PSD용)", use_container_width=True):
+            if uploaded_images:
+                # Save uploaded images into temp, then package
+                tmp = tempfile.mkdtemp(prefix="misharp_imgs_")
+                ordered_paths = []
+                try:
+                    for n, im in uploaded_images:
+                        fn = sanitize_name(n)
+                        p = os.path.join(tmp, fn)
+                        im.convert("RGB").save(p, format="JPEG", quality=95)
+                        ordered_paths.append(p)
+
+                    pkg = make_psd_package(
+                        package_base_name=base_name,
+                        ordered_img_paths=ordered_paths,
+                        target_w=int(target_w),
+                        top_margin=int(top_margin),
+                        bottom_margin=int(bottom_margin),
+                        gap=int(gap),
+                        add_footer=bool(add_footer),
+                        footer_text=footer_text,
+                        footer_font=footer_font,
+                        footer_font_size=int(footer_font_size),
+                        footer_color_rgb=(80, 80, 80),
+                        footer_align=footer_align,
+                        footer_margin_top=int(footer_margin_top),
+                    )
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+            else:
+                # package directly from zip extracted files (already local)
+                pkg = make_psd_package(
+                    package_base_name=base_name,
+                    ordered_img_paths=zip_paths,
+                    target_w=int(target_w),
+                    top_margin=int(top_margin),
+                    bottom_margin=int(bottom_margin),
+                    gap=int(gap),
+                    add_footer=bool(add_footer),
+                    footer_text=footer_text,
+                    footer_font=footer_font,
+                    footer_font_size=int(footer_font_size),
+                    footer_color_rgb=(80, 80, 80),
+                    footer_align=footer_align,
+                    footer_margin_top=int(footer_margin_top),
+                )
+
+            pkg_name = f"{base_name}_PSD_PACKAGE.zip"
+            st.success("PSD 패키지 생성 완료! 아래 ZIP을 PC로 받아서 Photoshop에서 JSX를 실행하세요.")
+            st.download_button("⬇️ PSD 패키지(zip) 다운로드", data=pkg, file_name=pkg_name, mime="application/zip")
+
+            st.markdown(
+                """
+### Photoshop에서 PSD 생성하는 방법 (딱 30초)
+1) 방금 받은 ZIP을 **압축 해제**
+2) Photoshop 실행
+3) **파일 → 스크립트 → 찾아보기(Browse)**  
+4) 압축 해제 폴더의 `build_psd_smartobject.jsx` 선택
+5) 뜨는 창에서 `manifest.json` 선택  
+→ 끝! 같은 폴더에 **고급개체 레이어 살아있는 PSD**가 생성됩니다.
+"""
+            )
+    else:
+        st.warning("이미지를 먼저 업로드하세요.")
