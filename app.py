@@ -67,7 +67,7 @@ This program is for internal use by misharpcompany employees only and must not b
 # =========================
 DEFAULT_WIDTH = 900
 DEFAULT_TOP = 120
-DEFAULT_GAP = 80
+DEFAULT_GAP = 300
 DEFAULT_BOTTOM = 120
 
 IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"}
