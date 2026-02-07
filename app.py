@@ -1,374 +1,228 @@
-import io
-import json
-import os
-import zipfile
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List, Optional, Tuple
-
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image
+import json
+import zipfile
+import io
+from pathlib import Path
 
+# =========================================================
+# Page config
+# =========================================================
+st.set_page_config(
+    page_title="MISHARP 상세페이지 생산기",
+    layout="centered",
+)
 
-# =========================
-# Copyright
-# =========================
-COPYRIGHT_KR = """ⓒ misharpcompany. All rights reserved.
-본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.
-본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.
-"""
-
-COPYRIGHT_EN = """ⓒ misharpcompany. All rights reserved.
-This program is the intellectual property of misharpcompany. Unauthorized copying, distribution, or use is strictly prohibited.
-This program is for internal use by misharpcompany employees only and must not be disclosed or shared externally.
-"""
-
-
-# =========================
-# Page Config
-# =========================
-st.set_page_config(page_title="MISHARP 상세페이지 생산기 v3.1", layout="wide")
-
-DEFAULT_WIDTH = 900
-DEFAULT_TOP = 120
-DEFAULT_GAP = 80
-DEFAULT_BOTTOM = 120
-
-IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp", "tif", "tiff"}
-
-
-# =========================
-# Helpers
-# =========================
-def safe_name(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return "misharp_detail"
-    s = s.replace(" ", "_")
-    s = "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-", ".", "(", ")", "[", "]"))
-    return (s[:80] or "misharp_detail")
-
-
-def ext_of(filename: str) -> str:
-    fn = (filename or "").lower()
-    if "." in fn:
-        return fn.rsplit(".", 1)[-1]
-    return ""
-
-
-def is_image(filename: str) -> bool:
-    return ext_of(filename) in IMAGE_EXTS
-
-
-def load_jsx_bytes() -> Optional[bytes]:
-    # repo에 tools/misharp_detailpage.jsx로 두면 ZIP에 자동 포함
-    path = os.path.join("tools", "misharp_detailpage.jsx")
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return f.read()
-    return None
-
-
-def open_image_any(upload_bytes: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(upload_bytes))
-    try:
-        img.seek(0)  # gif 1프레임
-    except Exception:
-        pass
-    img = ImageOps.exif_transpose(img)
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGBA")
-    return img
-
-
-def resize_to_width(img: Image.Image, width: int) -> Image.Image:
-    w, h = img.size
-    if w == width:
-        return img
-    scale = width / float(w)
-    nh = int(round(h * scale))
-    return img.resize((width, max(1, nh)), Image.LANCZOS)
-
-
-def composite_detail_jpg(
-    items: List[Tuple[str, bytes]],
-    width: int,
-    top: int,
-    gap: int,
-    bottom: int,
-    bg=(255, 255, 255),
-) -> Tuple[bytes, dict]:
+# =========================================================
+# Global style (여성 직원용 · 미니멀)
+# =========================================================
+st.markdown(
     """
-    여러 장 이미지를 '상단/사이/하단 여백' 규칙으로 1장 JPG로 합성
-    returns: (jpg_bytes, meta)
-    """
-    resized_images: List[Tuple[str, Image.Image]] = []
-    heights: List[int] = []
+<style>
+.block-container {
+    max-width: 1100px;
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+}
 
-    for name, data in items:
-        img = open_image_any(data)
+h1 {
+    font-size: 2.0rem !important;
+    font-weight: 700 !important;
+    letter-spacing: -0.02em;
+}
+h2 {
+    font-size: 1.25rem !important;
+    font-weight: 650 !important;
+}
+h3 {
+    font-size: 1.05rem !important;
+    font-weight: 650 !important;
+}
 
-        # 투명 처리 → 흰 배경 합성
-        if img.mode == "RGBA":
-            base_rgba = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            base_rgba.alpha_composite(img)
-            img = base_rgba.convert("RGB")
-        else:
-            img = img.convert("RGB")
+p, label, div, span {
+    font-size: 0.95rem;
+}
 
-        img = resize_to_width(img, width)
-        resized_images.append((name, img))
-        heights.append(img.size[1])
+.stButton > button {
+    border-radius: 14px;
+    padding: 0.55rem 0.9rem;
+    font-weight: 600;
+}
 
-    n = len(resized_images)
-    total_h = top + bottom + sum(heights) + (gap * (n - 1) if n > 1 else 0)
+.stTextInput input, .stNumberInput input {
+    border-radius: 12px;
+    padding: 0.55rem 0.7rem;
+}
 
-    canvas = Image.new("RGB", (width, total_h), bg)
+section[data-testid="stFileUploaderDropzone"] {
+    border-radius: 14px;
+    padding: 1.1rem;
+}
 
-    y = top
-    placements = []
-    for idx, (name, img) in enumerate(resized_images, start=1):
-        canvas.paste(img, (0, y))
-        placements.append({"index": idx, "filename": name, "y": y, "w": width, "h": img.size[1]})
-        y += img.size[1] + gap
+img {
+    border-radius: 12px;
+}
 
-    buf = io.BytesIO()
-    canvas.save(buf, format="JPEG", quality=95, optimize=True)
+hr {
+    margin: 1.4rem 0;
+    opacity: 0.35;
+}
 
-    meta = {
-        "width": width,
-        "top": top,
-        "gap": gap,
-        "bottom": bottom,
-        "total_height": total_h,
-        "placements": placements,
-    }
-    return buf.getvalue(), meta
+.footer {
+    margin-top: 4rem;
+    text-align: center;
+    font-size: 0.72rem;
+    color: #888;
+    line-height: 1.6;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-
-# =========================
-# State
-# =========================
-@dataclass
-class Item:
-    name: str
-    data: bytes
-
-
-def ensure_state():
-    # 반드시 최상단에서 실행되어야 함
-    if "items" not in st.session_state or st.session_state.get("items") is None:
-        st.session_state["items"] = []
-
-
-def get_items() -> List[Item]:
-    items = st.session_state.get("items", [])
-    if items is None:
-        items = []
-        st.session_state["items"] = items
-    return items
-
-
-def add_files(files):
-    items = get_items()
-    for f in files:
-        # 상세페이지는 이미지들로 구성 (psd/gif 등은 별도 요구 없어서 일단 제외)
-        if not is_image(f.name):
-            continue
-        items.append(Item(name=f.name, data=f.getvalue()))
-    st.session_state["items"] = items
-
-
-def move_item(i: int, d: int):
-    items = get_items()
-    j = i + d
-    if 0 <= i < len(items) and 0 <= j < len(items):
-        items[i], items[j] = items[j], items[i]
-    st.session_state["items"] = items
-
-
-def delete_item(i: int):
-    items = get_items()
-    if 0 <= i < len(items):
-        items.pop(i)
-    st.session_state["items"] = items
-
-
-def clear_items():
-    st.session_state["items"] = []
-
-
-# =========================
-# UI
-# =========================
-ensure_state()
-
-st.title("MISHARP 상세페이지 생산기 v3.1")
-st.caption("여러 장 이미지 → (여백룰 적용) 1장 JPG 생성 + (Smart Object PSD는 Photoshop JSX로 생성)")
-
-left, right = st.columns([1.05, 0.95], gap="large")
-
-with left:
-    st.subheader("1) 이미지 업로드 (여러 장 / 개수 제한 없음)")
-    uploaded = st.file_uploader(
-        "JPG/PNG/WEBP/GIF 등 이미지 여러 장을 올리세요",
-        accept_multiple_files=True,
-        type=None,
-    )
-
-    items_now = get_items()
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("업로드 목록에 추가", type="primary", disabled=not uploaded):
-            add_files(uploaded)
-            st.rerun()
-    with c2:
-        # ⭐️ 여기서 session_state 직접 참조하지 않음 (TypeError 방지)
-        if st.button("목록 전체 비우기", disabled=(len(items_now) == 0)):
-            clear_items()
-            st.rerun()
-
-    st.divider()
-    st.subheader("2) 상세페이지 룰(여백 설정)")
-    width = st.number_input("상세페이지 폭(px)", min_value=600, max_value=1600, value=DEFAULT_WIDTH, step=10)
-    top = st.number_input("최상단 흰여백(px)", min_value=0, max_value=600, value=DEFAULT_TOP, step=10)
-    gap = st.number_input("사진 사이 여백(px)", min_value=0, max_value=600, value=DEFAULT_GAP, step=10)
-    bottom = st.number_input("최하단 흰여백(px)", min_value=0, max_value=600, value=DEFAULT_BOTTOM, step=10)
-
-    base_name = st.text_input("저장 베이스명", value="misharp_detail")
-
-with right:
-    st.subheader("3) 미리보기 / 순서 변경 / 삭제")
-    items_now = get_items()
-
-    if not items_now:
-        st.write("왼쪽에서 업로드 후 **업로드 목록에 추가**를 눌러주세요.")
-    else:
-        for i, it in enumerate(items_now):
-            cols = st.columns([0.22, 0.48, 0.10, 0.10, 0.10])
-
-            with cols[0]:
-                try:
-                    thumb = open_image_any(it.data)
-                    thumb.thumbnail((240, 240))
-                    tb = io.BytesIO()
-                    thumb.save(tb, format="PNG", optimize=True)
-                    st.image(tb.getvalue(), use_container_width=True)
-                except Exception:
-                    st.write("IMG")
-
-            with cols[1]:
-                st.write(f"**{i+1}. {it.name}**")
-                st.caption(f"{len(it.data):,} bytes")
-
-            with cols[2]:
-                st.button("↑", key=f"up_{i}", on_click=move_item, args=(i, -1), disabled=(i == 0))
-            with cols[3]:
-                st.button("↓", key=f"down_{i}", on_click=move_item, args=(i, +1), disabled=(i == len(items_now) - 1))
-            with cols[4]:
-                st.button("🗑", key=f"del_{i}", on_click=delete_item, args=(i,))
+# =========================================================
+# Title
+# =========================================================
+st.title("MISHARP 상세페이지 생산기")
+st.caption("여백 룰 기반 JPG 생성 + Photoshop Smart Object PSD 스크립트")
 
 st.divider()
-st.subheader("4) 결과물 생성")
 
-items_now = get_items()
-base = safe_name(base_name)
+# =========================================================
+# Session state
+# =========================================================
+if "items" not in st.session_state:
+    st.session_state.items = []
 
-gen_disabled = (len(items_now) == 0)
-if st.button("상세페이지 생성하기 (JPG + PSD패키지 ZIP)", type="primary", disabled=gen_disabled):
-    img_list = [(it.name, it.data) for it in items_now]
-    detail_jpg, meta = composite_detail_jpg(
-        img_list,
-        width=int(width),
-        top=int(top),
-        gap=int(gap),
-        bottom=int(bottom),
-    )
+# =========================================================
+# Upload
+# =========================================================
+st.subheader("이미지 업로드")
 
-    job = {
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "layout": {
-            "width": int(width),
-            "top": int(top),
-            "gap": int(gap),
-            "bottom": int(bottom),
-            "total_height": int(meta["total_height"]),
-            "background": "#FFFFFF",
-        },
-        "images": [
+uploaded_files = st.file_uploader(
+    "JPG / PNG / WEBP / GIF 등 여러 장을 업로드하세요",
+    type=None,
+    accept_multiple_files=True,
+)
+
+if uploaded_files:
+    for f in uploaded_files:
+        st.session_state.items.append(
             {
-                "index": p["index"],
-                "original_filename": p["filename"],
-                "zip_filename": f"images/image_{p['index']:03d}.jpg",
-                "y": int(p["y"]),
-                "w": int(p["w"]),
-                "h": int(p["h"]),
-                "layer_name": f"IMAGE_{p['index']:03d}",
+                "name": f.name,
+                "file": f,
             }
-            for p in meta["placements"]
-        ],
-        "outputs": {
-            "detail_jpg": f"{base}.jpg",
-            "psd": "output.psd",
-            "jpg_from_psd": "output.jpg",
-        },
-    }
-    job_bytes = json.dumps(job, ensure_ascii=False, indent=2).encode("utf-8")
-
-    zip_buf = io.BytesIO()
-    jsx_bytes = load_jsx_bytes()
-
-    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr(f"{base}.jpg", detail_jpg)
-        z.writestr("job.json", job_bytes)
-
-        # images/ 정규화된 JPG로 넣기
-        for idx, it in enumerate(items_now, start=1):
-            img = open_image_any(it.data)
-            if img.mode == "RGBA":
-                base_rgba = Image.new("RGBA", img.size, (255, 255, 255, 255))
-                base_rgba.alpha_composite(img)
-                img_rgb = base_rgba.convert("RGB")
-            else:
-                img_rgb = img.convert("RGB")
-
-            img_rgb = resize_to_width(img_rgb, int(width))
-            buf = io.BytesIO()
-            img_rgb.save(buf, format="JPEG", quality=95, optimize=True)
-            z.writestr(f"images/image_{idx:03d}.jpg", buf.getvalue())
-
-        if jsx_bytes:
-            z.writestr("misharp_detailpage.jsx", jsx_bytes)
-
-        z.writestr("COPYRIGHT.txt", (COPYRIGHT_KR + "\n\n" + COPYRIGHT_EN).encode("utf-8"))
-
-    st.success("생성 완료! 아래에서 JPG와 ZIP을 다운로드하세요.")
-    st.image(detail_jpg, caption=f"{base}.jpg (여백룰 적용)", use_container_width=True)
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        st.download_button("상세페이지 JPG 다운로드", data=detail_jpg, file_name=f"{base}.jpg", mime="image/jpeg")
-    with c2:
-        st.download_button("job.json 다운로드", data=job_bytes, file_name=f"{base}_job.json", mime="application/json")
-    with c3:
-        st.download_button(
-            "PSD 패키지 ZIP 다운로드 (추천)",
-            data=zip_buf.getvalue(),
-            file_name=f"{base}_package.zip",
-            mime="application/zip",
         )
 
-    st.markdown(
-        """
-### Photoshop에서 PSD 생성(레이어 살아있는 고급개체)
-1) ZIP을 풀어 폴더에 `job.json`, `images/` 폴더가 있는지 확인  
-2) 포토샵 → **파일 > 스크립트 > 찾아보기…** → `misharp_detailpage.jsx` 실행  
-3) **ZIP을 푼 폴더**를 선택  
-4) 같은 폴더(또는 선택한 폴더)에 `output.psd`, `output.jpg` 생성
-"""
+# =========================================================
+# Uploaded list
+# =========================================================
+if st.session_state.items:
+    st.subheader("업로드된 이미지")
+
+    for idx, item in enumerate(st.session_state.items):
+        col1, col2, col3 = st.columns([1, 4, 1])
+        with col1:
+            st.image(item["file"], use_container_width=True)
+        with col2:
+            st.write(item["name"])
+        with col3:
+            if st.button("삭제", key=f"del_{idx}"):
+                st.session_state.items.pop(idx)
+                st.experimental_rerun()
+
+    st.divider()
+
+# =========================================================
+# Layout settings
+# =========================================================
+st.subheader("레이아웃 설정")
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    canvas_width = st.number_input("캔버스 폭(px)", 600, 2000, 900, step=50)
+with col2:
+    top_margin = st.number_input("상단 여백(px)", 0, 500, 80, step=10)
+with col3:
+    gap = st.number_input("이미지 간 여백(px)", 0, 500, 60, step=10)
+
+bottom_margin = st.number_input("하단 여백(px)", 0, 500, 120, step=10)
+
+# =========================================================
+# Generate
+# =========================================================
+st.divider()
+
+if st.button("상세페이지 생성", type="primary", disabled=len(st.session_state.items) == 0):
+    images = []
+    y_cursor = top_margin
+
+    # 이미지 정보 계산
+    for i, item in enumerate(st.session_state.items):
+        with Image.open(item["file"]) as img:
+            w, h = img.size
+            scale = canvas_width / w
+            new_h = int(h * scale)
+
+        images.append(
+            {
+                "zip_filename": f"images/image_{i+1:03d}{Path(item['name']).suffix.lower()}",
+                "layer_name": f"IMAGE_{i+1}",
+                "y": y_cursor,
+            }
+        )
+        y_cursor += new_h + gap
+
+    total_height = y_cursor - gap + bottom_margin
+
+    job = {
+        "layout": {
+            "width": canvas_width,
+            "total_height": total_height,
+        },
+        "images": images,
+    }
+
+    # ZIP 생성
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("job.json", json.dumps(job, ensure_ascii=False, indent=2))
+
+        for i, item in enumerate(st.session_state.items):
+            zf.writestr(
+                images[i]["zip_filename"],
+                item["file"].getbuffer(),
+            )
+
+        # JSX 포함
+        jsx_path = Path("tools/misharp_detailpage.jsx")
+        if jsx_path.exists():
+            zf.write(jsx_path, "misharp_detailpage.jsx")
+
+    zip_buffer.seek(0)
+
+    st.success("생성 완료! ZIP을 다운로드 후 Photoshop에서 JSX를 실행하세요.")
+    st.download_button(
+        "ZIP 다운로드",
+        zip_buffer,
+        file_name="misharp_detailpage_job.zip",
+        mime="application/zip",
     )
 
-st.divider()
-st.markdown(COPYRIGHT_KR)
-st.markdown("")
-st.markdown(COPYRIGHT_EN)
+# =========================================================
+# Footer copyright
+# =========================================================
+st.markdown(
+    """
+<div class="footer">
+ⓒ misharpcompany. All rights reserved.<br>
+본 프로그램의 저작권은 미샵컴퍼니(misharpcompany)에 있으며, 무단 복제·배포·사용을 금합니다.<br>
+본 프로그램은 미샵컴퍼니 내부 직원 전용으로, 외부 유출 및 제3자 제공을 엄격히 금합니다.<br><br>
+ⓒ misharpcompany. All rights reserved.<br>
+This program is the intellectual property of misharpcompany.<br>
+Unauthorized copying, distribution, or use is strictly prohibited.<br>
+For internal use only.
+</div>
+""",
+    unsafe_allow_html=True,
+)
