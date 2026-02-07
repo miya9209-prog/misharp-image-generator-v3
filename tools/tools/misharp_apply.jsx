@@ -1,120 +1,130 @@
-import io
-import json
-import zipfile
-from datetime import datetime
+#target photoshop
+app.displayDialogs = DialogModes.NO;
 
-import streamlit as st
-from PIL import Image
+/*
+ * MISHARP PSD 자동 생성기 (v3 동일 UX)
+ * 1) 템플릿 PSD 선택
+ * 2) 치환할 이미지 선택
+ * 3) job.json 선택 (상품명)
+ * 4) 저장 폴더 선택 → output.psd / output.jpg 생성
+ *
+ * 템플릿 PSD 조건:
+ * - 스마트오브젝트 레이어명: IMAGE_1
+ * - 텍스트 레이어명: 상품명
+ */
 
-# =========================
-# MISHARP 이미지 생성기 v3.1
-# (v3 동일 방식)
-# - Streamlit: 작업파일 생성(이미지 + job.json + (선택) ZIP)
-# - Photoshop JSX: PSD 선택 + 이미지 선택 + job.json 선택 → PSD+JPG 출력
-# =========================
+function readTextFile(f) {
+  f.encoding = "UTF8";
+  if (!f.open("r")) throw new Error("파일 열기 실패: " + f.fsName);
+  var s = f.read();
+  f.close();
+  return s;
+}
 
-st.set_page_config(page_title="MISHARP 이미지 생성기 v3.1", layout="centered")
-
-st.title("MISHARP 이미지 생성기 v3.1")
-st.caption("v3 동일 방식: Streamlit은 작업파일 생성(개별+ZIP) → Photoshop 스크립트가 PSD+JPG 출력")
-st.info("중요: 이 앱은 PSD를 생성/보관하지 않습니다. 템플릿 PSD는 포토샵 스크립트 실행 시 직접 선택합니다.")
-
-# ---------- 입력 UI ----------
-up = st.file_uploader("치환할 이미지 업로드", type=["png", "jpg", "jpeg", "webp"])
-product_name = st.text_input("상품명", value="", placeholder="예) 뮤 반오픈 카라 스트라이프 니트")
-
-st.divider()
-st.subheader("작업파일 생성 옵션")
-
-col1, col2 = st.columns(2)
-with col1:
-    base_name = st.text_input("파일 베이스명", value="misharp_job", help="다운로드 파일명 앞부분(예: misharp_job_input.png)")
-with col2:
-    force_png = st.checkbox("이미지를 PNG로 변환해 저장", value=True, help="포토샵 처리 호환성/안정성↑")
-
-def _safe_filename(s: str) -> str:
-    s = (s or "").strip()
-    if not s:
-        return "misharp_job"
-    s = s.replace(" ", "_")
-    s = "".join(ch for ch in s if ch.isalnum() or ch in ("_", "-", "."))[:80]
-    return s or "misharp_job"
-
-def _to_png_bytes(upload_bytes: bytes) -> bytes:
-    img = Image.open(io.BytesIO(upload_bytes))
-    # 색공간/투명도 이슈 방지
-    if img.mode not in ("RGB", "RGBA"):
-        img = img.convert("RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
-
-def build_outputs(upload_bytes: bytes, product_name: str):
-    # (1) 이미지 bytes (PNG 권장)
-    input_png = _to_png_bytes(upload_bytes) if force_png else _to_png_bytes(upload_bytes)
-
-    # (2) job.json bytes
-    job = {
-        "product_name": (product_name or "").strip(),
-        # 아래 값은 참고용(포토샵 스크립트는 고정 레이어명 사용)
-        "image_layer": "IMAGE_1",
-        "text_layer": "상품명",
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+function findLayerByName(container, name) {
+  for (var i = 0; i < container.layers.length; i++) {
+    var L = container.layers[i];
+    if (L.name === name) return L;
+    if (L.typename === "LayerSet") {
+      var r = findLayerByName(L, name);
+      if (r) return r;
     }
-    job_json = json.dumps(job, ensure_ascii=False, indent=2).encode("utf-8")
+  }
+  return null;
+}
 
-    # (3) ZIP bytes (input + job만 포함)
-    zbuf = io.BytesIO()
-    with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("input.png", input_png)
-        z.writestr("job.json", job_json)
+function replaceTextLayer(doc, layerName, newText) {
+  var lyr = findLayerByName(doc, layerName);
+  if (!lyr || lyr.kind !== LayerKind.TEXT) return false;
+  lyr.textItem.contents = newText;
+  return true;
+}
 
-    return input_png, job_json, zbuf.getvalue()
+function replaceSmartObjectByImage(doc, smartLayerName, imageFile) {
+  var lyr = findLayerByName(doc, smartLayerName);
+  if (!lyr) throw new Error("스마트오브젝트 레이어 없음: " + smartLayerName);
 
-disabled = up is None
-gen = st.button("작업파일 생성", type="primary", disabled=disabled)
+  doc.activeLayer = lyr;
 
-if gen and up is not None:
-    base = _safe_filename(base_name)
-    input_png, job_json, zip_bytes = build_outputs(up.getvalue(), product_name)
+  // 스마트오브젝트 내용 열기
+  executeAction(stringIDToTypeID("placedLayerEditContents"), undefined, DialogModes.NO);
 
-    st.success("생성 완료! 아래에서 개별 다운로드 또는 ZIP 다운로드를 선택하세요.")
+  var soDoc = app.activeDocument;
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "이미지 다운로드 (input.png)",
-            data=input_png,
-            file_name=f"{base}_input.png",
-            mime="image/png",
-        )
-    with c2:
-        st.download_button(
-            "job.json 다운로드",
-            data=job_json,
-            file_name=f"{base}_job.json",
-            mime="application/json",
-        )
+  // 기존 레이어 삭제(가능 범위)
+  for (var i = soDoc.layers.length - 1; i >= 0; i--) {
+    try { soDoc.layers[i].remove(); } catch (e) {}
+  }
 
-    st.download_button(
-        "ZIP 한 번에 다운로드 (추천)",
-        data=zip_bytes,
-        file_name=f"{base}.zip",
-        mime="application/zip",
-    )
+  // 이미지 Place
+  var desc = new ActionDescriptor();
+  desc.putPath(charIDToTypeID("null"), imageFile);
+  desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa"));
+  executeAction(charIDToTypeID("Plc "), desc, DialogModes.NO);
 
-    st.divider()
-    st.subheader("포토샵 처리 방법 (v3 동일)")
-    st.markdown(
-        """
-**Photoshop에서 스크립트 실행 순서**
-1) 포토샵 실행 → **파일 > 스크립트 > 찾아보기…** → `misharp_apply.jsx` 선택  
-2) 창이 뜨면 순서대로 선택  
-   - **템플릿 PSD 선택**  
-   - **치환할 이미지 선택** (`*_input.png` 또는 zip에서 나온 `input.png`)  
-   - **job.json 선택** (`*_job.json` 또는 zip에서 나온 `job.json`)  
-3) 저장 폴더 선택 → `output.psd`, `output.jpg` 생성 완료
-        """.strip()
-    )
+  var placed = soDoc.activeLayer;
 
-st.caption("※ ZIP을 받았다면 압축을 풀어 `input.png`, `job.json`만 사용하면 됩니다. (PSD는 포토샵에서 직접 선택)")
+  // cover 맞춤
+  var soW = soDoc.width.as("px"), soH = soDoc.height.as("px");
+  var b = placed.bounds;
+  var w = (b[2].as("px") - b[0].as("px"));
+  var h = (b[3].as("px") - b[1].as("px"));
+  var scale = Math.max(soW / w, soH / h) * 100;
+  placed.resize(scale, scale, AnchorPosition.MIDDLECENTER);
+
+  // 중앙 정렬
+  b = placed.bounds;
+  placed.translate(
+    soW / 2 - (b[0].as("px") + b[2].as("px")) / 2,
+    soH / 2 - (b[1].as("px") + b[3].as("px")) / 2
+  );
+
+  soDoc.save();
+  soDoc.close(SaveOptions.SAVECHANGES);
+  app.activeDocument = doc;
+}
+
+function saveOutputs(doc, outFolder) {
+  var psdFile = new File(outFolder.fsName + "/output.psd");
+  var psdOpt = new PhotoshopSaveOptions();
+  psdOpt.layers = true;
+  doc.saveAs(psdFile, psdOpt, true, Extension.LOWERCASE);
+
+  var jpgFile = new File(outFolder.fsName + "/output.jpg");
+  var jpgOpt = new JPEGSaveOptions();
+  jpgOpt.quality = 10;
+  doc.saveAs(jpgFile, jpgOpt, true, Extension.LOWERCASE);
+}
+
+try {
+  var psdFile = File.openDialog("템플릿 PSD 선택", "*.psd");
+  if (!psdFile) throw new Error("PSD 선택 취소");
+
+  var imageFile = File.openDialog("치환할 이미지 선택", "*.png;*.jpg;*.jpeg;*.webp");
+  if (!imageFile) throw new Error("이미지 선택 취소");
+
+  var jobFile = File.openDialog("job.json 선택 (상품명)", "*.json");
+  if (!jobFile) throw new Error("job.json 선택 취소");
+
+  var job = JSON.parse(readTextFile(jobFile));
+  var productName = job.product_name || "";
+
+  var doc = app.open(psdFile);
+
+  var okText = replaceTextLayer(doc, "상품명", productName);
+  if (!okText) alert("경고: '상품명' 텍스트 레이어를 찾지 못했습니다. 계속 진행합니다.");
+
+  replaceSmartObjectByImage(doc, "IMAGE_1", imageFile);
+
+  var outFolder = Folder.selectDialog("결과 저장 폴더 선택");
+  if (!outFolder) throw new Error("저장 폴더 선택 취소");
+
+  saveOutputs(doc, outFolder);
+
+  doc.close(SaveOptions.DONOTSAVECHANGES);
+
+  alert("완료! output.psd / output.jpg 생성되었습니다.");
+} catch (e) {
+  alert("오류:\n" + e.toString());
+  try { app.activeDocument.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
+}
