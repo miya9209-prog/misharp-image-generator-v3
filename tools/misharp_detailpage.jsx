@@ -2,13 +2,14 @@
 app.displayDialogs = DialogModes.NO;
 
 /*
-MISHARP 상세페이지 PSD 생성기 (Smart Object 레이어 유지)
+MISHARP 상세페이지 PSD 생성기 (즉시 PSD 오픈)
 
-사용법:
-1) Streamlit에서 ZIP 다운로드 후 압축 해제
-2) Photoshop → 파일 > 스크립트 > 찾아보기… → misharp_detailpage.jsx 실행
-3) 압축 해제 폴더 선택 (job.json + images/ 폴더 필요)
-4) output.psd / output.jpg 생성
+- 사용법:
+  1) Streamlit ZIP 다운로드 → 압축 해제
+  2) Photoshop → 파일 > 스크립트 > 찾아보기… → (압축 해제 폴더의) misharp_detailpage.jsx 실행
+  3) 바로 PSD가 생성되어 열립니다. (Smart Object 레이어 유지)
+
+※ job.json, images/ 폴더는 jsx와 같은 폴더에 있어야 합니다.
 */
 
 function readTextFile(f) {
@@ -48,24 +49,14 @@ function moveLayerTo(layer, x, y) {
   layer.translate(x - b.L, y - b.T);
 }
 
-function savePSDAndJPG(doc, outFolder) {
-  var psdFile = new File(outFolder.fsName + "/output.psd");
-  var psdOpt = new PhotoshopSaveOptions();
-  psdOpt.layers = true;
-  doc.saveAs(psdFile, psdOpt, true, Extension.LOWERCASE);
-
-  var jpgFile = new File(outFolder.fsName + "/output.jpg");
-  var jpgOpt = new JPEGSaveOptions();
-  jpgOpt.quality = 10;
-  doc.saveAs(jpgFile, jpgOpt, true, Extension.LOWERCASE);
-}
-
 try {
-  var jobFolder = Folder.selectDialog("ZIP을 푼 폴더를 선택하세요 (job.json, images/ 필요)");
-  if (!jobFolder) throw new Error("폴더 선택 취소");
+  // ✅ 폴더 선택 없이: 이 jsx가 있는 폴더를 작업폴더로 사용
+  var jobFolder = File($.fileName).parent;
 
   var jobFile = new File(jobFolder.fsName + "/job.json");
-  if (!jobFile.exists) throw new Error("job.json이 없습니다: " + jobFile.fsName);
+  if (!jobFile.exists) {
+    throw new Error("job.json이 없습니다. jsx와 같은 폴더에 job.json이 있어야 합니다.\n" + jobFile.fsName);
+  }
 
   var job = JSON.parse(readTextFile(jobFile));
   var width = job.layout.width;
@@ -73,7 +64,7 @@ try {
 
   if (!width || !totalHeight) throw new Error("job.json의 layout.width 또는 layout.total_height가 없습니다.");
 
-  // 새 문서 생성(흰 배경)
+  // ✅ 새 문서 생성(흰 배경) — 만들자마자 PSD가 '열림'
   var doc = app.documents.add(
     width,
     totalHeight,
@@ -98,22 +89,13 @@ try {
     var layer = placeFileAsSmartObject(imgFile);
     layer.name = layerName;
 
-    // 폭 맞추고 y 위치로 이동
     scaleLayerToWidth(layer, width);
     moveLayerTo(layer, 0, y);
   }
 
-  // 저장 폴더 선택(선택 취소 시 jobFolder에 저장)
-  var outFolder = Folder.selectDialog("저장 폴더 선택 (output.psd / output.jpg)");
-  if (!outFolder) outFolder = jobFolder;
-
-  savePSDAndJPG(doc, outFolder);
-
-  doc.close(SaveOptions.DONOTSAVECHANGES);
-  alert("완료! output.psd / output.jpg 생성되었습니다.");
+  // ✅ 여기서 저장/닫기/알림을 하지 않음
+  // -> "예전처럼" PSD가 그대로 열린 상태로 남음(레이어/고급개체 살아있음)
 
 } catch (e) {
   alert("오류:\n" + e.toString());
-  try { if (app.documents.length > 0) app.activeDocument.close(SaveOptions.DONOTSAVECHANGES); } catch (e2) {}
 }
-
