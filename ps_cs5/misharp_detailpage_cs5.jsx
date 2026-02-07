@@ -1,13 +1,16 @@
 #target photoshop
-app.displayDialogs = DialogModes.NO;
 
 (function () {
 
-    // SETTINGS
-    var CANVAS_WIDTH = 900;
-    var TOP_MARGIN = 80;
-    var GAP = 70;
-    var BOTTOM_MARGIN = 120;
+    // ===== SILENT / SPEED SETTINGS =====
+    var SHOW_DONE_ALERT = false;        // 끝나고 팝업 끄기
+    var DO_REFRESH = false;             // 중간 화면 갱신 최소화
+
+    // ===== LAYOUT SETTINGS (v3에서 숫자 치환됨) =====
+    var CANVAS_WIDTH = 900;      // px
+    var TOP_MARGIN = 80;         // px
+    var GAP = 70;                // px
+    var BOTTOM_MARGIN = 120;     // px
 
     var FOOTER_ENABLED = true;
     var FOOTER_TEXT = "© MISHARP. All rights reserved.  |  misharp.co.kr";
@@ -16,8 +19,10 @@ app.displayDialogs = DialogModes.NO;
     var FOOTER_COLOR = [80, 80, 80];
     var FOOTER_MARGIN_TOP = 40;
 
-    var JPG_QUALITY = 10; // 1~12
+    var JPG_QUALITY = 10;        // 1~12
 
+
+    // ===== helpers =====
     function px(v) { return new UnitValue(v, "px"); }
 
     function baseName(fileName) {
@@ -49,10 +54,16 @@ app.displayDialogs = DialogModes.NO;
     }
 
     function placeAsSmartObject(file) {
+        // 강제로 "Place Embedded" 를 Dialog 없이 실행
+        var oldDialogs = app.displayDialogs;
+        app.displayDialogs = DialogModes.NO;
+
         var desc = new ActionDescriptor();
         desc.putPath(charIDToTypeID("null"), file);
         desc.putEnumerated(charIDToTypeID("FTcs"), charIDToTypeID("QCSt"), charIDToTypeID("Qcsa"));
         executeAction(charIDToTypeID("Plc "), desc, DialogModes.NO);
+
+        app.displayDialogs = oldDialogs;
         return app.activeDocument.activeLayer;
     }
 
@@ -114,8 +125,15 @@ app.displayDialogs = DialogModes.NO;
         dup.close(SaveOptions.DONOTSAVECHANGES);
     }
 
-    // MAIN
+
+    // ===== main =====
     var originalRuler = app.preferences.rulerUnits;
+    var oldDialogs = app.displayDialogs;
+    var oldUnits = app.preferences.rulerUnits;
+    var oldActiveDoc = app.activeDocument;
+
+    // 가장 중요한 부분: "조용히 실행" + "화면 업데이트 최소화"
+    app.displayDialogs = DialogModes.NO;
     app.preferences.rulerUnits = Units.PIXELS;
 
     try {
@@ -133,11 +151,9 @@ app.displayDialogs = DialogModes.NO;
 
         var defaultName = baseName(images[0].name);
         var outName = prompt("Output file name (without extension)", defaultName);
-        if (!outName || outName.replace(/\s/g, "") === "") {
-            outName = defaultName;
-        }
+        if (!outName || outName.replace(/\s/g, "") === "") outName = defaultName;
 
-        // measure canvas height
+        // 1) canvas height 계산 (원본비율 유지)
         var scaledHeights = [];
         var totalImagesH = 0;
 
@@ -152,6 +168,7 @@ app.displayDialogs = DialogModes.NO;
         var footerH = FOOTER_ENABLED ? (FOOTER_MARGIN_TOP + Math.round(FOOTER_SIZE * 2.2) + 12) : 0;
         var canvasH = TOP_MARGIN + totalImagesH + (GAP * (images.length - 1)) + BOTTOM_MARGIN + footerH;
 
+        // 2) 새 PSD 만들기
         var doc = app.documents.add(
             px(CANVAS_WIDTH),
             px(canvasH),
@@ -161,20 +178,20 @@ app.displayDialogs = DialogModes.NO;
             DocumentFill.WHITE
         );
 
-        // stack
+        // 화면 업데이트 최소화: background layer 잠금 유지, history도 최소화
         var y = TOP_MARGIN;
 
         for (var j = 0; j < images.length; j++) {
             var layer = placeAsSmartObject(images[j]);
             layer.name = images[j].name;
 
-            app.refresh();
+            // refresh 제거(움직임/깜빡임 줄이기)
             resizeLayerToWidth(layer, CANVAS_WIDTH);
-            app.refresh();
             moveLayerTo(layer, 0, y);
-            app.refresh();
 
             y += scaledHeights[j] + GAP;
+
+            if (DO_REFRESH) app.refresh();
         }
 
         if (FOOTER_ENABLED) {
@@ -182,17 +199,22 @@ app.displayDialogs = DialogModes.NO;
             addFooter(doc, y);
         }
 
+        // 3) 저장
         var psdFile = new File(outFolder.fsName + "/" + outName + ".psd");
         var jpgFile = new File(outFolder.fsName + "/" + outName + ".jpg");
 
         savePSD(doc, psdFile);
         saveJPGFromPSD(doc, jpgFile);
 
-        alert("Done.\nSaved:\n" + psdFile.fsName + "\n" + jpgFile.fsName);
+        if (SHOW_DONE_ALERT) {
+            alert("Done.\nSaved:\n" + psdFile.fsName + "\n" + jpgFile.fsName);
+        }
 
     } catch (err) {
         alert("Error:\n" + err);
     } finally {
+        app.displayDialogs = oldDialogs;
+        app.preferences.rulerUnits = oldUnits;
         app.preferences.rulerUnits = originalRuler;
     }
 
