@@ -7,6 +7,109 @@ from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
 import streamlit as st
+import hashlib
+import re
+
+def _truthy(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _load_auth_secrets():
+    # Secrets에서 읽기 (없어도 앱이 죽지 않게 안전처리)
+    try:
+        enabled = _truthy(st.secrets.get("AUTH_ENABLED", False))
+        hashes = st.secrets.get("ACCESS_CODE_HASHES", [])
+        revoked = st.secrets.get("REVOKED_LABELS", [])
+    except Exception:
+        enabled, hashes, revoked = False, [], []
+
+    # hashes는 ["label:hash", ...] 형태
+    auth_map = {}
+    if isinstance(hashes, (list, tuple)):
+        for x in hashes:
+            if not isinstance(x, str):
+                continue
+            if ":" not in x:
+                continue
+            label, h = x.split(":", 1)
+            label = label.strip()
+            h = h.strip()
+            if label and h:
+                auth_map[label] = h
+
+    revoked_set = set()
+    if isinstance(revoked, (list, tuple)):
+        revoked_set = set([str(x).strip() for x in revoked if str(x).strip()])
+
+    return enabled, auth_map, revoked_set
+
+def auth_gate():
+    enabled, auth_map, revoked_set = _load_auth_secrets()
+    if not enabled:
+        return True  # 로그인 기능 OFF면 바로 통과
+
+    # 이미 로그인 했으면 통과
+    if st.session_state.get("auth_ok") is True:
+        # 로그아웃 버튼 (사이드바)
+        with st.sidebar:
+            st.caption(f"로그인: {st.session_state.get('auth_label','')}")
+            if st.button("로그아웃"):
+                st.session_state["auth_ok"] = False
+                st.session_state["auth_label"] = ""
+                st.rerun()
+        return True
+
+    # 로그인 화면
+    st.markdown("## 🔒 접속 코드 입력")
+    st.caption("미샵 내부 직원 전용입니다. 관리자에게 발급받은 코드를 입력하세요.")
+    code = st.text_input("접속 코드", type="password", placeholder="MSPGV3-9F2K-7XQ3-ABCD")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        login_clicked = st.button("로그인", use_container_width=True)
+
+    # 디버그(해시 목록은 절대 노출하지 않음)
+    with col2:
+        st.caption("※ 코드가 없으면 관리자에게 요청하세요.")
+
+    if not login_clicked:
+        st.stop()
+
+    raw = (code or "").strip().upper()
+    raw = re.sub(r"\s+", "", raw)
+    if not raw:
+        st.error("코드를 입력해 주세요.")
+        st.stop()
+
+    h = _sha256(raw)
+
+    # hash 일치하는 label 찾기
+    matched_label = None
+    for label, saved_hash in auth_map.items():
+        if h == saved_hash:
+            matched_label = label
+            break
+
+    if matched_label is None:
+        st.error("코드가 올바르지 않습니다.")
+        st.stop()
+
+    if matched_label in revoked_set:
+        st.error("해당 코드는 차단되었습니다. 관리자에게 문의하세요.")
+        st.stop()
+
+    st.session_state["auth_ok"] = True
+    st.session_state["auth_label"] = matched_label
+    st.success("로그인 성공! 잠시 후 프로그램으로 이동합니다.")
+    st.rerun()
+
 from PIL import Image, ImageSequence
 
 APP_TITLE = "MISHARP 상세페이지 생성기"
@@ -474,6 +577,9 @@ def _build_outputs(base_name: str, top_pad: int, bottom_pad: int, gap: int):
 
 
 def main():
+        if not auth_gate():
+        return
+
     # ✅ 로그인 강제
     require_access_code()
     logout_box()
