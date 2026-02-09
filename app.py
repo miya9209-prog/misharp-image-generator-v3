@@ -4,29 +4,29 @@ import re
 import zipfile
 import hashlib
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 from PIL import Image, ImageSequence
 
+
 # =========================================================
-# Streamlit Page Config  (⚠️ 최상단에서 1회 호출 권장)
+# APP CONFIG
 # =========================================================
 APP_TITLE = "MISHARP 상세페이지 생성기"
 APP_SUBTITLE = "MISHARP PSD GENERATOR V3"
-st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 CANVAS_WIDTH = 900
 
-# ✅ 분할 규칙
+# ✅ 분할 규칙 (현재 운영 방식 유지: 10장 초과 시 PSD 2개로 분할, 최대 20장)
 MAX_PER_PSD = 10
-MAX_TOTAL_IMAGES = 20  # 10장 초과 시 PSD 2개 분할 (최대 20장까지)
+MAX_TOTAL_IMAGES = 20
 
 DEFAULT_TOP_PAD = 180
 DEFAULT_BOTTOM_PAD = 250
 DEFAULT_GAP = 300
 
-# ✅ 썸네일 크기
+# ✅ 썸네일 (현재 안정버전 기준: 70)
 THUMB_W = 70
 
 STATE_ITEMS = "img_items"
@@ -34,139 +34,140 @@ STATE_SEEN = "seen_hashes"
 STATE_LAST_PREVIEW = "last_preview_jpg"
 STATE_LAST_ZIP = "last_bundle_zip"
 STATE_LAST_META = "last_meta"
+STATE_AUTH_OK = "auth_ok"
+STATE_AUTH_LABEL = "auth_label"
 
 
 # =========================================================
-# AUTH (Access Code Login)  ✅ 이것만 사용 (중복 제거)
+# AUTH (ACCESS CODE GATE)
 # =========================================================
-def _sha256(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
 def _truthy(v) -> bool:
+    """
+    Streamlit Secrets에서 AUTH_ENABLED가
+    - true/false(bool)
+    - "true"/"false"(string)
+    - 1/0 등으로 들어와도 안전 처리
+    """
     if isinstance(v, bool):
         return v
     if v is None:
         return False
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
 
 
-def _load_allowed_hashes() -> Dict[str, str]:
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _load_auth_secrets() -> Tuple[bool, Dict[str, str], set]:
     """
     Secrets 예시:
-    ACCESS_CODE_HASHES = [
-      "code01:hash...",
-      "code02:hash..."
-    ]
+    AUTH_ENABLED = true
+    ACCESS_CODE_HASHES = ["code01:abcd...", ...]
+    REVOKED_LABELS = ["code02", ...]
     """
-    raw_list = st.secrets.get("ACCESS_CODE_HASHES", [])
-    allowed: Dict[str, str] = {}
-    if isinstance(raw_list, (list, tuple)):
-        for item in raw_list:
-            if isinstance(item, str) and ":" in item:
-                label, h = item.split(":", 1)
-                label = label.strip()
-                h = h.strip()
-                if label and h:
-                    allowed[label] = h
-    return allowed
+    try:
+        enabled = _truthy(st.secrets.get("AUTH_ENABLED", False))
+        hashes = st.secrets.get("ACCESS_CODE_HASHES", [])
+        revoked = st.secrets.get("REVOKED_LABELS", [])
+    except Exception:
+        enabled, hashes, revoked = False, [], []
+
+    auth_map: Dict[str, str] = {}
+    if isinstance(hashes, (list, tuple)):
+        for x in hashes:
+            if not isinstance(x, str) or ":" not in x:
+                continue
+            label, h = x.split(":", 1)
+            label = label.strip()
+            h = h.strip()
+            if label and h:
+                auth_map[label] = h
+
+    revoked_set = set()
+    if isinstance(revoked, (list, tuple)):
+        revoked_set = set([str(x).strip() for x in revoked if str(x).strip()])
+
+    return enabled, auth_map, revoked_set
 
 
-def _load_revoked_labels() -> set:
+def require_login():
     """
-    Secrets 예시:
-    REVOKED_LABELS = ["code02", "staff05"]
+    - AUTH_ENABLED=true면 로그인 화면 강제
+    - 성공 시 session_state에 auth_ok/auth_label 저장
     """
-    raw = st.secrets.get("REVOKED_LABELS", [])
-    revoked = set()
-    if isinstance(raw, (list, tuple)):
-        for x in raw:
-            if isinstance(x, str) and x.strip():
-                revoked.add(x.strip())
-    return revoked
+    enabled, auth_map, revoked_set = _load_auth_secrets()
 
-
-def require_access_code():
-    """
-    - AUTH_ENABLED=true면 로그인 필수
-    - label 기반 차단(REVOKED_LABELS) 지원
-    """
-    auth_enabled = _truthy(st.secrets.get("AUTH_ENABLED", False))
-    if not auth_enabled:
-        st.session_state["authenticated"] = True
+    # 로그인 OFF면 통과
+    if not enabled:
+        st.session_state[STATE_AUTH_OK] = True
+        st.session_state[STATE_AUTH_LABEL] = "AUTH_OFF"
         return
 
-    if st.session_state.get("authenticated"):
+    # 이미 로그인 OK면 통과
+    if st.session_state.get(STATE_AUTH_OK) is True:
         return
 
-    st.markdown(
-        """
-        <div style="padding:14px 0 8px 0;">
-          <div style="font-size:26px; font-weight:800; letter-spacing:-0.5px;">MISHARP 내부 전용</div>
-          <div style="font-size:13px; opacity:0.75; margin-top:4px;">접속 코드를 입력해야 사용 가능합니다.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    # 로그인 화면
+    st.markdown("## 🔒 접속 코드 입력")
+    st.caption("미샵 내부 직원 전용입니다. 관리자에게 발급받은 코드를 입력하세요.")
+
+    code = st.text_input(
+        "접속 코드",
+        type="password",
+        placeholder="MSPGV3-9F2K-7XQ3-ABCD",
     )
 
-    code = st.text_input("접속 코드", type="password", placeholder="MSPGV3-XXXX-XXXX-XXXX")
-    c1, c2 = st.columns([0.62, 0.38])
+    c1, c2 = st.columns([1, 1])
     with c1:
-        ok = st.button("로그인", type="primary", use_container_width=True)
+        login_clicked = st.button("로그인", type="primary", use_container_width=True)
     with c2:
-        st.button(
-            "입력 초기화",
-            use_container_width=True,
-            on_click=lambda: st.session_state.pop("authenticated", None),
-        )
+        st.button("입력 초기화", use_container_width=True, on_click=lambda: st.session_state.pop("tmp_code", None))
 
-    if ok:
-        allowed = _load_allowed_hashes()
-        revoked = _load_revoked_labels()
+    if not login_clicked:
+        st.stop()
 
-        entered = (code or "").strip().upper()
-        entered = re.sub(r"\s+", "", entered)
+    raw = (code or "").strip().upper()
+    raw = re.sub(r"\s+", "", raw)
+    if not raw:
+        st.error("코드를 입력해 주세요.")
+        st.stop()
 
-        if not entered:
-            st.error("코드를 입력해주세요.")
-            st.stop()
+    entered_hash = _sha256(raw)
 
-        entered_hash = _sha256(entered)
+    matched_label: Optional[str] = None
+    for label, saved_hash in auth_map.items():
+        if entered_hash == saved_hash:
+            matched_label = label
+            break
 
-        matched_label = None
-        for label, h in allowed.items():
-            if entered_hash == h:
-                matched_label = label
-                break
+    if matched_label is None:
+        st.error("코드가 올바르지 않습니다.")
+        st.stop()
 
-        if not matched_label:
-            st.error("코드가 올바르지 않습니다.")
-            st.stop()
+    if matched_label in revoked_set:
+        st.error("해당 코드는 차단되었습니다. 관리자에게 문의하세요.")
+        st.stop()
 
-        if matched_label in revoked:
-            st.error("이 코드는 차단(중지)되었습니다. 관리자에게 문의하세요.")
-            st.stop()
-
-        st.session_state["authenticated"] = True
-        st.session_state["auth_label"] = matched_label
-        st.success(f"인증 완료 ({matched_label})")
-        st.rerun()
-
-    st.stop()
+    st.session_state[STATE_AUTH_OK] = True
+    st.session_state[STATE_AUTH_LABEL] = matched_label
+    st.success("로그인 성공! 프로그램으로 이동합니다.")
+    st.rerun()
 
 
-def logout_box():
+def sidebar_auth_box():
     with st.sidebar:
         st.markdown("### 접근 상태")
-        st.caption(f"label: **{st.session_state.get('auth_label','-')}**")
+        st.caption(f"label: **{st.session_state.get(STATE_AUTH_LABEL, '-') }**")
         if st.button("로그아웃", use_container_width=True):
-            st.session_state.pop("authenticated", None)
-            st.session_state.pop("auth_label", None)
+            st.session_state.pop(STATE_AUTH_OK, None)
+            st.session_state.pop(STATE_AUTH_LABEL, None)
             st.rerun()
 
 
 # =========================================================
-# CORE
+# IMAGE UTIL
 # =========================================================
 @dataclass
 class ImgItem:
@@ -182,7 +183,7 @@ def _sha1(data: bytes) -> str:
 
 
 def _sanitize_filename(name: str) -> str:
-    name = name.strip()
+    name = (name or "").strip()
     if not name:
         return "misharp_detailpage"
     name = re.sub(r"\s+", "_", name)
@@ -257,7 +258,21 @@ def _save_jpg_bytes(im: Image.Image) -> bytes:
     return out.getvalue()
 
 
-def _build_jsx(base_name: str, canvas_h: int, top_pad: int, gap: int, heights: List[int], image_files: List[str], images_folder_name: str) -> str:
+def _calc_total_height(resized_heights: List[int], top_pad: int, bottom_pad: int, gap: int) -> int:
+    if not resized_heights:
+        return 0
+    return top_pad + bottom_pad + sum(resized_heights) + gap * (len(resized_heights) - 1)
+
+
+def _build_jsx(
+    base_name: str,
+    canvas_h: int,
+    top_pad: int,
+    gap: int,
+    heights: List[int],
+    image_files: List[str],
+    images_folder_name: str,
+) -> str:
     y_positions = []
     y = top_pad
     for h in heights:
@@ -339,7 +354,7 @@ def _build_readme() -> str:
     return (
         "MISHARP 상세페이지 생성기 (내부용)\n\n"
         "[규칙]\n"
-        f"- JPG: 전체 이미지 1장으로 생성\n"
+        "- JPG: 전체 이미지 1장으로 생성\n"
         f"- PSD: {MAX_PER_PSD}장 초과 시 자동 2개로 분할\n"
         f"- 최대 등록: {MAX_TOTAL_IMAGES}장\n\n"
         "[PSD 생성 방법]\n"
@@ -402,6 +417,7 @@ def _add_one_image(name: str, raw: bytes) -> bool:
 def _add_items_from_uploads(uploaded_files) -> Tuple[int, int]:
     added = 0
     skipped_over_limit = 0
+
     for uf in uploaded_files:
         remaining = MAX_TOTAL_IMAGES - len(st.session_state[STATE_ITEMS])
         if remaining <= 0:
@@ -427,16 +443,10 @@ def _add_items_from_uploads(uploaded_files) -> Tuple[int, int]:
     return added, skipped_over_limit
 
 
-def _calc_total_height(resized_heights: List[int], top_pad: int, bottom_pad: int, gap: int) -> int:
-    if not resized_heights:
-        return 0
-    return top_pad + bottom_pad + sum(resized_heights) + gap * (len(resized_heights) - 1)
-
-
 def _build_outputs(base_name: str, top_pad: int, bottom_pad: int, gap: int):
     items: List[ImgItem] = st.session_state[STATE_ITEMS]
 
-    # unique by sha1
+    # unique by sha1 (중복 방지)
     uniq: List[ImgItem] = []
     seen2 = set()
     for it in items:
@@ -452,7 +462,7 @@ def _build_outputs(base_name: str, top_pad: int, bottom_pad: int, gap: int):
     long_img = _compose_long_jpg(resized_all, top_pad=top_pad, bottom_pad=bottom_pad, gap=gap)
     jpg_bytes = _save_jpg_bytes(long_img)
 
-    # PSD 분할
+    # PSD 분할 (10장 초과 시 2개)
     if len(resized_all) <= MAX_PER_PSD:
         parts = [resized_all]
     else:
@@ -475,6 +485,7 @@ def _build_outputs(base_name: str, top_pad: int, bottom_pad: int, gap: int):
             fn = f"img_{idx:02d}.jpg"
             files.append((fn, _save_jpg_bytes(im)))
             fns.append(fn)
+
         resized_groups.append((folder_name, files))
 
         jsx_text = _build_jsx(
@@ -495,16 +506,24 @@ def _build_outputs(base_name: str, top_pad: int, bottom_pad: int, gap: int):
         "bottom": bottom_pad,
         "gap": gap,
         "psd_parts": len(parts),
+        "max_total": MAX_TOTAL_IMAGES,
+        "max_per_psd": MAX_PER_PSD,
     }
+
     zip_bytes = _zip_bundle(base_name, jpg_bytes, jsx_entries, resized_groups)
     return jpg_bytes, zip_bytes, meta
 
 
+# =========================================================
+# UI
+# =========================================================
 def main():
-    # ✅ 로그인 강제 (이것만)
-    require_access_code()
-    logout_box()
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
 
+    # ✅ 로그인은 무조건 "가장 먼저" 실행 (이 아래로는 인증된 사용자만)
+    require_login()
+
+    sidebar_auth_box()
     _init_state()
 
     st.markdown(
@@ -540,17 +559,20 @@ def main():
             "업로드 파일 목록에 추가",
             type="primary",
             use_container_width=True,
-            disabled=(not uploaded) or (current_count >= MAX_TOTAL_IMAGES and not replace_mode),
+            disabled=(not uploaded) and (not replace_mode),
         )
 
         if add_clicked and uploaded:
             if replace_mode:
                 _reset_all()
+                current_count = 0
+
             added, skipped_limit = _add_items_from_uploads(uploaded)
             if added == 0:
                 st.warning("추가된 새 이미지가 없습니다. (중복 제외 또는 제한 초과)")
             else:
                 st.success(f"추가 완료: 새 이미지 {added}개")
+
             if skipped_limit > 0:
                 st.warning(f"최대 {MAX_TOTAL_IMAGES}장 제한으로 {skipped_limit}개 파일(또는 ZIP 내 이미지)이 추가되지 않았습니다.")
 
@@ -637,8 +659,20 @@ def main():
             st.image(jpg_bytes, use_column_width=True)
 
             st.markdown("### 다운로드")
-            st.download_button("JPG 다운로드", data=jpg_bytes, file_name=f"{base_name}.jpg", mime="image/jpeg", use_container_width=True)
-            st.download_button("ZIP(PSD용 JSX + images 포함) 다운로드", data=zip_bytes, file_name=f"{base_name}_bundle.zip", mime="application/zip", use_container_width=True)
+            st.download_button(
+                "JPG 다운로드",
+                data=jpg_bytes,
+                file_name=f"{base_name}.jpg",
+                mime="image/jpeg",
+                use_container_width=True,
+            )
+            st.download_button(
+                "ZIP(PSD용 JSX + images 포함) 다운로드",
+                data=zip_bytes,
+                file_name=f"{base_name}_bundle.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
         else:
             st.info("아직 생성된 결과가 없습니다. 왼쪽에서 생성 버튼을 눌러주세요.")
 
